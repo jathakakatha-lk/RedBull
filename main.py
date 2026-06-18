@@ -48,8 +48,8 @@ def load_data():
         
         # Dynamic Settings
         'base_margin': 0.80,            
-        'margin_sl_pct': 27.0,         
-        'fast_tp_pct': 30.0,           
+        'margin_sl_pct': 50.0,         
+        'fast_tp_pct': 25.0,           
         
         # Dynamic Time Window Settings (Stored in Hours and Minutes)
         'start_hour': 12,
