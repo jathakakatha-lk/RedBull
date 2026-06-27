@@ -10,7 +10,7 @@ from binance.client import Client
 from flask import Flask, request
 import pytz  
 
-# --- 1. CONFIGURATIONS ---
+# --- 1. CONFIGURATIONS & INITIALIZATION ---
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -54,14 +54,14 @@ def load_data():
         'fast_tp_pct': 30.0,            
         'leverage': 10,                 
         
-        # 04. සියලුම කාල රාමුවල නව Default සැකසුම්
-        'sig_start_hour': 12, 'sig_start_minute': 30,  # 2. Trade Signal Time (දවල් 12:30)
-        'sig_end_hour': 23, 'sig_end_minute': 59,      # (රාත්‍රී 11:59)
+        'sig_start_hour': 12, 'sig_start_minute': 30,  
+        'sig_end_hour': 23, 'sig_end_minute': 59,      
         
-        'rec_start_hour': 8, 'rec_start_minute': 0,    # 3. Recovery Trade Time (උදේ 08:00)
-        'rec_end_hour': 23, 'rec_end_minute': 59,      # (රාත්‍රී 11:59)
+        'rec_start_hour': 8, 'rec_start_minute': 0,    
+        'rec_end_hour': 23, 'rec_end_minute': 59,      
         
-        'coin_stats': {} 
+        'coin_stats': {},
+        'scanned_coins_count': 0  
     }
     if os.path.exists(DB_FILE):
         try:
@@ -83,6 +83,7 @@ def sync_save():
             with open(DB_FILE, 'w') as f: json.dump(state, f)
     except Exception as e: print(f"Save Error: {e}")
 
+# --- 3. TELEGRAM MESSENGER CORE ---
 def execute_telegram_send(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": str(TELEGRAM_CHAT_ID).strip(), "text": msg, "parse_mode": "HTML"}
@@ -97,7 +98,7 @@ def execute_telegram_send(msg):
             time.sleep(2)
     return False
 
-# 2. Trade Signal නිකුත් කරන කාල රාමුව පරීක්ෂාව (දවල් 12:30 - රාත්‍රී 11:59)
+# --- 4. TIME WINDOW CHECKERS ---
 def is_signal_window():
     try:
         tz = pytz.timezone(BOT_TIMEZONE)
@@ -109,7 +110,6 @@ def is_signal_window():
         return start_time <= total_minutes <= end_time
     except: return True
 
-# 3. Recovery Trades ක්‍රියාත්මක වන කාල රාමුව පරීක්ෂාව (උදේ 08:00 - රාත්‍රී 11:59)
 def is_recovery_window():
     try:
         tz = pytz.timezone(BOT_TIMEZONE)
@@ -121,6 +121,7 @@ def is_recovery_window():
         return start_time <= total_minutes <= end_time
     except: return True
 
+# --- 5. MARKET TREND & ZONE ANALYZER ---
 TREND_CACHE = {}
 CACHE_DURATION_SEC = 900  
 
@@ -154,6 +155,7 @@ def get_1h_trend_zone(symbol):
         if symbol in TREND_CACHE: return TREND_CACHE[symbol][1]
         return "BUY_ZONE"
 
+# --- 6. 5M FRACTAL & INDICATOR ALIGNMENT ---
 def find_strict_20_bar_fractal(df, side):
     highs = df['high'].astype(float).tolist()
     lows = df['low'].astype(float).tolist()
@@ -192,7 +194,7 @@ def check_5m_indicator_alignment(df, zone):
         if find_strict_20_bar_fractal(df, "SELL"): return "SELL"
     return "NONE"
 
-# 1. First Win Scanner - පැය 24 පුරාම (කාල සීමා නොමැතිව) නොනවත්වා ක්‍රියාත්මක වේ
+# --- 7. BACKGROUND MARKET SCANNER (24/7) ---
 def scan_markets():
     while True:
         try:
@@ -206,8 +208,12 @@ def scan_markets():
             position_size = current_margin * leverage 
             
             if is_scanning and not bot_paused:
-                res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
+                res = requests.get("https://fapi.binance.com/v1/ticker/24hr", timeout=15)
                 symbols = [t['symbol'] for t in res.json() if t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0 and position_size >= 5.0]
+                
+                with state_lock:
+                    state['scanned_coins_count'] = len(symbols)
+                
                 for s in symbols:
                     if s in state.get('block_list', []): continue
                     if s in active_positions: continue
@@ -224,12 +230,10 @@ def scan_markets():
                         execute_trade = False
                         if (zone_status == "SELL_ZONE" and signal_type == "SELL") or (zone_status == "BUY_ZONE" and signal_type == "BUY"):
                             if s in state.get('first_win_list', []):
-                                # 2. & 3. Verified කාසි සිග්නල් දීම සහ ට්‍රේඩ් එකක් ඇරඹීම සිදුවන්නේ අදාළ කාල රාමු 2ම විවෘතව ඇත්නම් පමණි
                                 if is_signal_window() and is_recovery_window():
                                     if coin_step > 0 or (len([p for p in active_positions.values() if p['symbol'] in state['first_win_list']]) < max_signals):
                                         execute_trade = True
                             else:
-                                # Background Scanner එක පැය 24ම නව කාසි සොයා ගනී
                                 execute_trade = True
                                 
                         if execute_trade:
@@ -238,6 +242,7 @@ def scan_markets():
             time.sleep(5)
         except: time.sleep(15)
 
+# --- 8. RECOVERY ORDER EXECUTION ENGINE ---
 def execute_new_recovery_trade(s, side, current_p):
     with state_lock:
         step = state['symbol_recovery_step'].get(s, 0)
@@ -305,17 +310,7 @@ def execute_new_recovery_trade(s, side, current_p):
         
     sync_save()
 
-def telegram_reminder_worker():
-    while True:
-        try:
-            time.sleep(60) 
-            with state_lock:
-                is_pending = state.get('pending_acknowledgement', False)
-                system_active = state.get('reminder_system_active', True)
-            if is_pending and system_active: 
-                execute_telegram_send("⚠️ මතක් කිරීම නැවැත්වීමට <b>/ok</b> විධානය ලබාදෙන්න. ⚠️")
-        except: pass
-
+# --- 9. LIVE POSITION MONITOR LOOP ---
 def live_monitor_loop():
     while True:
         try:
@@ -326,7 +321,6 @@ def live_monitor_loop():
                 side = pos['side']
                 is_verified = s in state.get('first_win_list', [])
                 
-                # 3. Recovery Trade පියවර ක්‍රියාත්මක වන්නේ දෙන ලද Recovery කාල සීමාව තුළ පමණි
                 if is_verified and not is_recovery_window():
                     time.sleep(1); continue
                     
@@ -380,6 +374,18 @@ def live_monitor_loop():
             time.sleep(2)
         except: time.sleep(5)
 
+# --- 10. CRON WORKERS & DAILY REPORTING ---
+def telegram_reminder_worker():
+    while True:
+        try:
+            time.sleep(60) 
+            with state_lock:
+                is_pending = state.get('pending_acknowledgement', False)
+                system_active = state.get('reminder_system_active', True)
+            if is_pending and system_active: 
+                execute_telegram_send("⚠️ මතක් කිරීම නැවැත්වීමට <b>/ok</b> විධානය ලබාදෙන්න. ⚠️")
+        except: pass
+
 def generate_report_text(ds, title_prefix="📅 TODAY'S"):
     return (f"📊 <b>{title_prefix} PERFORMANCE REPORT</b>\n━━━━━━━━━━━━━━━━━━━\n\n🟢 Wins: <b>{ds.get('wins', 0)}</b>\n🔴 Loss: <b>{ds.get('loss', 0)}</b>\n\nMr. MASTER👑")
 
@@ -398,7 +404,7 @@ def cron_daily_report_worker():
             time.sleep(30)
         except: time.sleep(10)
 
-# --- 💬 12. TELEGRAM WEBHOOK MANAGER ---
+# --- 11. TELEGRAM WEBHOOK MANAGER (COMMANDS) ---
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
     try:
@@ -454,7 +460,6 @@ def telegram_webhook():
                     if coin_to_rem in state['first_win_list']: state['first_win_list'].remove(coin_to_rem)
                 sync_save(); execute_telegram_send(f"❌ <code>{coin_to_rem}</code> First Win List එකෙන් ඉවත් කළා."); return "OK", 200
             
-            # 04. සියලුම කාලසීමාවන් එකවර වෙනස් කිරීමේ Command එක (උදා: /set_times 12:30 23:59 08:00 23:59)
             elif cmd == "set_times" and len(tokens) > 4:
                 try:
                     sig_start = tokens[1].split(":")
@@ -499,7 +504,7 @@ def telegram_webhook():
                            f"▶️ ස්කෑනර් එන්ට්‍රීම: <b>{'සක්‍රීයයි (ON)' if state.get('is_scanning') else 'අක්‍රීයයි (OFF)'}</b>\n"
                            f"⏱️ SIGNAL WINDOW: <b>{sig_window} ({state.get('sig_start_hour',12):02d}:{state.get('sig_start_minute',30):02d} - {state.get('sig_end_hour',23):02d}:{state.get('sig_end_minute',59):02d})</b>\n"
                            f"⏱️ RECOVERY WINDOW: <b>{rec_window} ({state.get('rec_start_hour',8):02d}:{state.get('rec_start_minute',0):02d} - {state.get('rec_end_hour',23):02d}:{state.get('rec_end_minute',59):02d})</b>\n"
-                           f"🔍 SCANNER STATUS: <b>24 Hours Non-Stop 🔄</b>\n\n"
+                           f"🔍 SCANNER STATUS: <b>Total Scanned Coins: {state.get('scanned_coins_count', 0)} 🔄</b>\n\n"
                            f"🔥 Verified සජීවී ට්‍රේඩ්: <b>{len([p for p in state['active_positions'].values() if p['symbol'] in state['first_win_list']])} / {state.get('max_signals')}</b>\n"
                            f"💵 මූලික මාජින්: <b>${state.get('base_margin', 0.80)}</b> | Leverage: <b>{state.get('leverage', 10)}x</b>\n"
                            f"🛡️ SL: <b>{state.get('margin_sl_pct', 27.0)}%</b> | TP: <b>{state.get('fast_tp_pct', 30.0)}%</b>\n"
@@ -533,6 +538,7 @@ def telegram_webhook():
     except: pass
     return "OK", 200
 
+# --- 12. FLASK SERVER & APPLICATION START ---
 @app.route('/', methods=['GET'])
 def health(): return "Live Recovery Bot Active With Background Filter!", 200
 
