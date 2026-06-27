@@ -188,6 +188,8 @@ def check_5m_indicator_alignment(df, zone):
     ema_60 = closes.ewm(span=60, adjust=False).mean().iloc[-1]
     ema_80 = closes.ewm(span=80, adjust=False).mean().iloc[-1]
     ema_500 = closes.ewm(span=500, adjust=False).mean().iloc[-1]
+    
+    # 🎯 [YOUR EXPLICIT FORMULA]: මුල් සිද්ධාන්තයටම අනුව EMA 500 මුලට දමා සකස් කරන ලදී
     if zone == "BUY_ZONE" and (ema_500 > ema_80) and (ema_80 > ema_60):
         if find_strict_20_bar_fractal(df, "BUY"): return "BUY"
     elif zone == "SELL_ZONE" and (ema_500 < ema_80) and (ema_80 < ema_60):
@@ -211,8 +213,10 @@ def scan_markets():
                 res = requests.get("https://fapi.binance.com/v1/ticker/24hr", timeout=15)
                 symbols = [t['symbol'] for t in res.json() if t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0 and position_size >= 5.0]
                 
-                with state_lock:
-                    state['scanned_coins_count'] = len(symbols)
+                # ⚙️ [SCANNER STATUS COUNT FIX]: දත්ත සාර්ථකව ලැබුණොත් පමණක් Count එක වෙනස් කරයි
+                if symbols:
+                    with state_lock:
+                        state['scanned_coins_count'] = len(symbols)
                 
                 for s in symbols:
                     if s in state.get('block_list', []): continue
@@ -341,7 +345,12 @@ def live_monitor_loop():
                     if (side == "BUY" and current_p >= pos['tp']) or (side == "SELL" and current_p <= pos['tp']):
                         with state_lock:
                             state['stats']['wins'] += 1; state['daily_stats']['wins'] += 1
-                            if s not in state['first_win_list']: state['first_win_list'].append(s)
+                            
+                            # 🥇 [FIRST WIN LIST RECOVERY UPDATE]: 3 වැනි පියවර (Step 2) ඇතුලත දින්නොත් පමණක් List එකට දමයි.
+                            if pos['step'] < 3:
+                                if s not in state['first_win_list']: 
+                                    state['first_win_list'].append(s)
+                                    
                             if s in state['coin_stats']: state['coin_stats'][s]["profit"] += 1
                             state['symbol_recovery_step'][s] = 0; state['symbol_accumulated_loss'][s] = 0.0
                             if s in state['active_positions']: del state['active_positions'][s]
@@ -502,8 +511,8 @@ def telegram_webhook():
                 with state_lock:
                     msg = (f"ℹ️ <b>[RED BULL MASTER STATUS REPORT]</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                            f"▶️ ස්කෑනර් එන්ට්‍රීම: <b>{'සක්‍රීයයි (ON)' if state.get('is_scanning') else 'අක්‍රීයයි (OFF)'}</b>\n"
-                           f"⏱️ SIGNAL WINDOW: <b>{sig_window} ({state.get('sig_start_hour',12):02d}:{state.get('sig_start_minute',30):02d} - {state.get('sig_end_hour',23):02d}:{state.get('sig_end_minute',59):02d})</b>\n"
-                           f"⏱️ RECOVERY WINDOW: <b>{rec_window} ({state.get('rec_start_hour',8):02d}:{state.get('rec_start_minute',0):02d} - {state.get('rec_end_hour',23):02d}:{state.get('rec_end_minute',59):02d})</b>\n"
+                           f"⏱️ SIGNAL WINDOW: <b>{state.get('sig_start_hour',12):02d}:{state.get('sig_start_minute',30):02d} - {state.get('sig_end_hour',23):02d}:{state.get('sig_end_minute',59):02d} ({sig_window})</b>\n"
+                           f"⏱️ RECOVERY WINDOW: <b>{state.get('rec_start_hour',8):02d}:{state.get('rec_start_minute',0):02d} - {state.get('rec_end_hour',23):02d}:{state.get('rec_end_minute',59):02d} ({rec_window})</b>\n"
                            f"🔍 SCANNER STATUS: <b>Total Scanned Coins: {state.get('scanned_coins_count', 0)} 🔄</b>\n\n"
                            f"🔥 Verified සජීවී ට්‍රේඩ්: <b>{len([p for p in state['active_positions'].values() if p['symbol'] in state['first_win_list']])} / {state.get('max_signals')}</b>\n"
                            f"💵 මූලික මාජින්: <b>${state.get('base_margin', 0.80)}</b> | Leverage: <b>{state.get('leverage', 10)}x</b>\n"
