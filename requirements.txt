@@ -1,7 +1,8 @@
-Flask
-requests
+python-binance
 pandas
 numpy
-python-binance
-pytz
+requests
+flask
+statsmodels
+scipy
 gunicorn
