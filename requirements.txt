@@ -1,8 +1,0 @@
-python-binance
-pandas
-numpy
-requests
-flask
-statsmodels
-scipy
-gunicorn
