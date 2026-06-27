@@ -211,12 +211,20 @@ def scan_markets():
             
             if is_scanning and not bot_paused:
                 res = requests.get("https://fapi.binance.com/v1/ticker/24hr", timeout=15)
-                symbols = [t['symbol'] for t in res.json() if t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0 and position_size >= 5.0]
+                ticker_data = res.json()
                 
-                # ⚙️ [SCANNER STATUS COUNT FIX]: දත්ත සාර්ථකව ලැබුණොත් පමණක් Count එක වෙනස් කරයි
+                # Filter කරන ලද coins ලිස්ට් එක ලබා ගැනීම
+                symbols = [t['symbol'] for t in ticker_data if t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0 and position_size >= 5.0]
+                
+                # ✅ [FIX]: lock එක ක්‍රියාත්මක වන කාලය අවම කර, ආරක්ෂිතව අගය update කිරීම
                 if symbols:
                     with state_lock:
                         state['scanned_coins_count'] = len(symbols)
+                else:
+                    # Binance එකෙන් සේරම coins ලැබුනත් position_size condition එක නිසා 0 වෙන්න පුළුවන් බැවින්:
+                    all_usdt_coins = [t['symbol'] for t in ticker_data if t['symbol'].endswith("USDT")]
+                    with state_lock:
+                        state['scanned_coins_count'] = len(all_usdt_coins)
                 
                 for s in symbols:
                     if s in state.get('block_list', []): continue
@@ -242,9 +250,14 @@ def scan_markets():
                                 
                         if execute_trade:
                             execute_new_recovery_trade(s, signal_type, float(df['close'].iloc[-1]))
-                    except: pass
-            time.sleep(5)
-        except: time.sleep(15)
+                    except Exception as e: 
+                        print(f"Coin loop error for {s}: {e}") # Error එක බලාගැනීමට log එකක්
+            
+            # ටිකක් වැඩිපුර sleep එකක් දීමෙන් (උදා: තත්පර 15) API block වීම් වළකී
+            time.sleep(15)
+        except Exception as e: 
+            print(f"Scan markets main loop error: {e}")
+            time.sleep(15)
 
 # --- 8. RECOVERY ORDER EXECUTION ENGINE ---
 def execute_new_recovery_trade(s, side, current_p):
