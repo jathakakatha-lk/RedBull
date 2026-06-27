@@ -55,7 +55,6 @@ def load_data():
         'fast_tp_pct': 30.0,            
         'leverage': 10,                 
         
-        # ට්‍රේඩින් සිග්නල් ලබාදෙන කාලය (දවල් 12:30 සිට රාත්‍රී 23:59)
         'start_hour': 12,
         'start_minute': 30,
         'end_hour': 23,
@@ -112,13 +111,11 @@ def is_ict_trading_window():
         return False
     except: return True
 
-# ⭐ නව ශ්‍රිතය: රාත්‍රී 12 සිට උදේ 8 දක්වා කාලය පරීක්ෂා කිරීම (First Win List Scan Window)
 def is_first_win_scan_window():
     try:
         tz = pytz.timezone(BOT_TIMEZONE)
         tz_now = datetime.datetime.now(tz)
         current_hour = tz_now.hour
-        # පැය 0 සිට 7 දක්වා (එනම් 00:00 සිට 07:59 දක්වා කාලය උදේ 8 ට පෙර වේ)
         if 0 <= current_hour < 8: 
             return True
         return False
@@ -150,7 +147,7 @@ def get_1h_trend_zone(symbol):
             if prev_80 < prev_160 and curr_80 >= curr_160:
                 if curr_80 < curr_500: current_zone = "BUY_ZONE"
             elif prev_80 > prev_160 and curr_80 <= curr_160:
-                if curr_80 > 500: current_zone = "SELL_ZONE"
+                if curr_80 > curr_500: current_zone = "SELL_ZONE"
         TREND_CACHE[symbol] = (now, current_zone)
         return current_zone
     except:
@@ -198,7 +195,6 @@ def check_5m_indicator_alignment(df, zone):
 def scan_markets():
     while True:
         try:
-            # ⭐ නව වෙනස්කම: බොට් ක්‍රියාත්මක විය යුත්තේ එක්කෝ Trading Window එකේදී, නැත්නම් රාත්‍රී 12-8 First Win List එක පුරවන වෙලාවේදී පමණි.
             trading_active = is_ict_trading_window()
             fw_scan_active = is_first_win_scan_window()
             
@@ -222,7 +218,6 @@ def scan_markets():
                     if s in state.get('block_list', []): continue
                     if s in active_positions: continue
                     
-                    # ⭐ නව වෙනස්කම: සිග්නල් ලබාදෙන කාලය (දවල් 12:30-23:59) ඇතුළතදී, කාසියක් First Win List එකේ නැත්නම් එය සම්පූර්ණයෙන්ම මඟ හරින්න (අලුත් කාසි එකතු නොවේ)
                     if trading_active and (s not in first_win_list_coins):
                         continue
                         
@@ -249,7 +244,6 @@ def scan_markets():
                                 if coin_step > 0 or (len([p for p in active_positions.values() if p['symbol'] in state['first_win_list']]) < max_signals):
                                     execute_trade = True
                             else:
-                                # කාසිය ලිස්ට් එකේ නැතිනම් ට්‍රේඩ් එක ගන්නේ රාත්‍රී 12-8 Scan window එක ඇතුළත නම් පමණි (Background Testing)
                                 if fw_scan_active:
                                     execute_trade = True
                                 
@@ -260,7 +254,6 @@ def scan_markets():
         except: time.sleep(15)
 
 def execute_new_recovery_trade(s, side, current_p):
-    # ට්‍රේඩ් එකක් සැබෑවටම විවෘත වන්නේ සිග්නල් දෙන වේලාව තුළ පමණක්දැයි නැවත තහවුරු කරගනී
     trading_active = is_ict_trading_window()
     
     with state_lock:
@@ -304,7 +297,6 @@ def execute_new_recovery_trade(s, side, current_p):
             "initial_1h_zone": get_1h_trend_zone(s) 
         }
         
-    # ටෙලිග්‍රෑම් පණිවිඩ යවන්නේ Verified කාසි සඳහා සහ නියමිත Trading Window එක ඇතුළත නම් පමණි
     if is_verified_coin and trading_active:
         with state_lock:
             state['signal_count'] += 1
@@ -329,7 +321,6 @@ def telegram_reminder_worker():
     while True:
         try:
             time.sleep(60) 
-            # සිහිගැන්වීම් යවන්නේද Trading Window එක ඇතුළත පමණි
             if is_ict_trading_window():
                 with state_lock:
                     is_pending = state.get('pending_acknowledgement', False)
@@ -364,7 +355,12 @@ def live_monitor_loop():
                         
                     if (side == "BUY" and current_p >= pos['tp']) or (side == "SELL" and current_p <= pos['tp']):
                         with state_lock:
-                            state['stats']['wins'] += 1; state['daily_stats']['wins'] += 1
+                            state['stats']['wins'] += 1
+                            
+                            # ⭐ [MODIFIED] දෛනික Wins වලට එකතු කරන්නේ Trading Window එකේදී සැබෑ සිග්නල් හරහා දිනූ ඒවා පමණි
+                            if is_verified and trading_active:
+                                state['daily_stats']['wins'] += 1
+                                
                             if s not in state['first_win_list']: 
                                 state['first_win_list'].append(s)
                             
@@ -381,7 +377,7 @@ def live_monitor_loop():
                     elif (side == "BUY" and current_p <= pos['sl']) or (side == "SELL" and current_p >= pos['sl']):
                         trade_loss = (pos['margin'] * state.get('leverage', 10)) * (abs(pos['entry_price'] - pos['sl']) / pos['entry_price'])
                         with state_lock:
-                            state['stats']['loss'] += 1; state['daily_stats']['loss'] += 1
+                            state['stats']['loss'] += 1
                             next_step = pos['step'] + 1
                             current_total_loss = state['symbol_accumulated_loss'].get(s, 0.0) + trade_loss
                             
@@ -390,6 +386,11 @@ def live_monitor_loop():
                                 if s in state.get('first_win_list', []): state['first_win_list'].remove(s)
                                 state['shared_loss_buffer'] += current_total_loss; state['shared_loss_splits'] = 8
                                 state['symbol_recovery_step'][s] = 0; state['symbol_accumulated_loss'][s] = 0.0
+                                
+                                # ⭐ [MODIFIED] දෛනික ලැයිස්තුවට Loss එකක් වැටෙන්නේ පියවර 4 ම අවසන් වී Blacklist වුවහොත් පමණි
+                                if is_verified and trading_active:
+                                    state['daily_stats']['loss'] += 1
+                                    
                                 if is_verified and trading_active:
                                     execute_telegram_send(f"❌ <b>TOTAL RECOVERY FAILED: {s}</b>\nපියවර 4ම අසාර්ථක විය! මෙම කාසිය බ්ලැක්ලිස්ට් කරන ලදී. 🚫")
                             else:
@@ -404,21 +405,18 @@ def live_monitor_loop():
         except: time.sleep(5)
 
 def generate_report_text(ds, title_prefix="📅 TODAY'S"):
-    return (f"📊 <b>{title_prefix} PERFORMANCE REPORT</b>\n━━━━━━━━━━━━━━━━━━━\n\n🟢 Wins: <b>{ds.get('wins', 0)}</b>\n🔴 Loss: <b>{ds.get('loss', 0)}</b>\n\nMr. MASTER👑")
+    return (f"📊 <b>{title_prefix} PERFORMANCE REPORT</b>\n━━━━━━━━━━━━━━━━━━━\n\n🟢 Wins (Real Signals): <b>{ds.get('wins', 0)}</b>\n🔴 Loss (Blacklisted): <b>{ds.get('loss', 0)}</b>\n\nMr. MASTER👑")
 
 def cron_daily_report_worker():
     while True:
         try:
             utc_now = datetime.datetime.now(datetime.timezone.utc)
-            # දවසේ වාර්තාව යවන වෙලාව සහ දෛනික ලිස්ට් එක Reset කිරීම (සෑම දිනකම දවල් 12:00 ට)
-            # මෙමඟින් 12:30 ට ඇරඹෙන අලුත් trading window එකට පිරිසිදු ලැයිස්තුවක් (Fresh list) ලැබේ.
-            if utc_now.hour == 6 and utc_now.minute == 30: # 6:30 UTC යනු 12:00 PM (Asia/Colombo) වේ
+            if utc_now.hour == 6 and utc_now.minute == 30: 
                 today_str = str(datetime.date.today())
                 with state_lock:
                     ds = state['daily_stats']
                     execute_telegram_send(generate_report_text(ds, title_prefix="✨ FINAL DAILY"))
                     
-                    # ⚠️ පැරණි First Win ලැයිස්තුව සහ Win Zones සම්පූර්ණයෙන්ම Clear කිරීම
                     state['first_win_list'] = []
                     state['symbol_last_win_zone'] = {}
                     state['daily_stats'] = {'wins': 0, 'loss': 0, 'won_trades': [], 'last_reset_date': today_str}
@@ -564,18 +562,26 @@ def telegram_webhook():
                 window_status = "ACTIVE 🟢" if is_ict_trading_window() else ("SCANNING NIGHT 💤" if is_first_win_scan_window() else "OFFLINE 🔴")
                 with state_lock:
                     rem_system = "සක්‍රීයයි 🔔" if state.get('reminder_system_active', True) else "අක්‍රීයයි 🔕"
+                    
+                    all_pos = state['active_positions'].values()
+                    fw_list = state.get('first_win_list', [])
+                    
+                    verified_count = len([p for p in all_pos if p['symbol'] in fw_list])
+                    bg_testing_count = len([p for p in all_pos if p['symbol'] not in fw_list])
+                    
                     msg = (f"ℹ️ <b>[RED BULL MASTER STATUS REPORT]</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                            f"▶️ ස්කෑනර් එන්ට්‍රීම: <b>{'සක්‍රීයයි (ON)' if state.get('is_scanning') else 'අක්‍රීයයි (OFF)'}</b>\n"
-                           f"🔥 Verified සජීවී ට්‍රේඩ් ගණන: <b>{len([p for p in state['active_positions'].values() if p['symbol'] in state['first_win_list']])} / {state.get('max_signals')}</b>\n"
+                           f"🔥 Verified සජීවී ට්‍රේඩ් ගණන: <b>{verified_count} / {state.get('max_signals')}</b>\n"
+                           f"🧪 Background Testing Trades: <b>{bg_testing_count}</b>\n"
                            f"📢 මතක් කිරීමේ පද්ධතිය: <b>{rem_system}</b>\n"
                            f"⏱️ BOT WINDOW STATUS : <b>{window_status}</b>\n"
                            f"⏰ සිග්නල් දෙන කාලය: <b>දවල් {state.get('start_hour',12)}:{state.get('start_minute',30)} සිට රාත්‍රී {state.get('end_hour',23)}:{state.get('end_minute',59)} දක්වා.</b>\n"
-                           f"🌙 කාසි තේරීමේ කාලය: <b>රාත්‍රී 00:00 සිට උදේ 08:00 දක්වා.</b>\n"
+                           f"🌙 AXIS ස්කෑන් කාලය: <b>රාත්‍රී 00:00 සිට උදේ 08:00 දක්වා.</b>\n"
                            f"💵 මූලික ට්‍රේඩ් මාජින්: <b>${state.get('base_margin', 0.80)}</b>\n"
                            f"⚙️ වත්මන් Leverage: <b>{state.get('leverage', 10)}x</b>\n"
                            f"🛡️ SL: <b>{state.get('margin_sl_pct', 27.0)}%</b>\n"
                            f"🎯 TP: <b>{state.get('fast_tp_pct', 30.0)}%</b>\n"
-                           f"🥇 First Win Coins ගණන: <b>{len(state.get('first_win_list', []))}</b>\n"
+                           f"🥇 First Win Coins ගණන: <b>{len(fw_list)}</b>\n"
                            f"🚫 Blacklist Coins ගණන: <b>{len(state.get('block_list', []))}</b>")
                 execute_telegram_send(msg)
                 return "OK", 200
@@ -599,7 +605,7 @@ def telegram_webhook():
                     f"• <code>/block_list</code> - තහනම් කළ කාසි ලැයිස්තුව\n"
                     f"• <code>/first_win_list</code> - First Win ලැබූ කාසි\n\n"
                     f"🥇 <b>2. කාසි Manual කළමනාකරණය</b>\n"
-                    f"• <code>/add_first [COINNAME]</code> -> First Win ලැයිස්තුවට දැමීමට\n"
+                    f"• <code>/add_first [COINNAME]</code> -> First Win ลැයිස්තුවට දැමීමට\n"
                     f"• <code>/remove_first [COINNAME]</code> -> First Win ලැයිස්තුවෙන් ඉවත් කිරීමට\n"
                     f"• <code>/add_block [COINNAME]</code> -> Blacklist ලැයිස්තුවට දැමීමට\n"
                     f"• <code>/remove_block [COINNAME]</code> -> Blacklist ලැයිස්තුවෙන් ඉවත් කිරීමට\n\n"
@@ -624,7 +630,7 @@ def telegram_webhook():
     return "OK", 200
 
 @app.route('/', methods=['GET'])
-def health(): return "Live Recovery Bot Active With Restricted 00:00-08:00 Background Filtering!", 200
+def health(): return "Live Recovery Bot Active With Corrected Performance Metrics!", 200
 
 if __name__ == '__main__':
     with state_lock: state['pending_acknowledgement'] = False
