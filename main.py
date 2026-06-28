@@ -357,7 +357,6 @@ def live_monitor_loop():
                         with state_lock:
                             state['stats']['wins'] += 1
                             
-                            # ⭐ [MODIFIED] දෛනික Wins වලට එකතු කරන්නේ Trading Window එකේදී සැබෑ සිග්නල් හරහා දිනූ ඒවා පමණි
                             if is_verified and trading_active:
                                 state['daily_stats']['wins'] += 1
                                 
@@ -387,7 +386,6 @@ def live_monitor_loop():
                                 state['shared_loss_buffer'] += current_total_loss; state['shared_loss_splits'] = 8
                                 state['symbol_recovery_step'][s] = 0; state['symbol_accumulated_loss'][s] = 0.0
                                 
-                                # ⭐ [MODIFIED] දෛනික ලැයිස්තුවට Loss එකක් වැටෙන්නේ පියවර 4 ම අවසන් වී Blacklist වුවහොත් පමණි
                                 if is_verified and trading_active:
                                     state['daily_stats']['loss'] += 1
                                     
@@ -410,15 +408,18 @@ def generate_report_text(ds, title_prefix="📅 TODAY'S"):
 def cron_daily_report_worker():
     while True:
         try:
-            utc_now = datetime.datetime.now(datetime.timezone.utc)
-            if utc_now.hour == 6 and utc_now.minute == 30: 
+            # ශ්‍රී ලංකා (Asia/Colombo) වත්මන් වේලාව ලබා ගැනීම
+            tz = pytz.timezone(BOT_TIMEZONE)
+            colombo_now = datetime.datetime.now(tz)
+            
+            # රාත්‍රී 11:59 (23:59) ද යන්න පරීක්ෂා කිරීම
+            if colombo_now.hour == 23 and colombo_now.minute == 59: 
                 today_str = str(datetime.date.today())
                 with state_lock:
                     ds = state['daily_stats']
                     execute_telegram_send(generate_report_text(ds, title_prefix="✨ FINAL DAILY"))
                     
-                    state['first_win_list'] = []
-                    state['symbol_last_win_zone'] = {}
+                    # [MODIFIED] දෛනිකව first_win_list එක රීසෙට් වන කේත කොටස ඉවත් කරන ලදී. (ලැයිස්තුව ආරක්ෂිතයි)
                     state['daily_stats'] = {'wins': 0, 'loss': 0, 'won_trades': [], 'last_reset_date': today_str}
                 sync_save(); time.sleep(60)
             time.sleep(30)
@@ -530,11 +531,9 @@ def telegram_webhook():
                     val = float(tokens[1])
                     with state_lock: 
                         state['margin_sl_pct'] = val
-                        state['first_win_list'] = []
-                        state['block_list'] = []
-                        state['symbol_last_win_zone'] = {}
+                        # ⭐ [MODIFIED] ලැයිස්තු Clear වන කේත පේළි ඉවත් කර ආරක්ෂා කරන ලදී.
                     sync_save()
-                    execute_telegram_send(f"🛡️ <b>[SL UPDATED & RESET]</b>\n• නව SL: <b>{val}%</b>\n⚠️ සියලුම ලිස්ට් සහ Win Zones මුළුමනින්ම Clear කරන ලදී!")
+                    execute_telegram_send(f"🛡️ <b>[SL UPDATED]</b>\n• නව SL: <b>{val}%</b>\n💡 සියලුම පවතින Lists සාර්ථකව ආරක්ෂා කරන ලදී.")
                 except: pass
                 return "OK", 200
             
@@ -543,11 +542,9 @@ def telegram_webhook():
                     val = float(tokens[1])
                     with state_lock: 
                         state['fast_tp_pct'] = val
-                        state['first_win_list'] = []
-                        state['block_list'] = []
-                        state['symbol_last_win_zone'] = {}
+                        # ⭐ [MODIFIED] ලැයිස්තු Clear වන කේත පේළි ඉවත් කර ආරක්ෂා කරන ලදී.
                     sync_save()
-                    execute_telegram_send(f"🎯 <b>[TP UPDATED & RESET]</b>\n• නව TP: <b>{val}%</b>\n⚠️ සියලුම ලිස්ට් සහ Win Zones මුළුමනින්ම Clear කරන ලදී!")
+                    execute_telegram_send(f"🎯 <b>[TP UPDATED]</b>\n• නව TP: <b>{val}%</b>\n💡 සියලුම පවතින Lists සාර්ථකව ආරක්ෂා කරන ලදී.")
                 except: pass
                 return "OK", 200
             
