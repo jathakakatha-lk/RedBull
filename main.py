@@ -131,11 +131,9 @@ def is_fw_scan_window():
     except: return True
 
 def count_total_bg_trades():
-    """ 🧪 Background හි සක්‍රීයව දත්ත රැස් කරන කාසි ගණන නිවැරදිව පෙන්වීම """
     with state_lock:
         bg_history = state.get('bg_signal_history', {})
         active_bg_count = sum(1 for v in bg_history.values() if len(v) > 0)
-        # පරණ දත්ත මැකී ඇත්නම්, දැනට ට්‍රෙන්ඩ් එකේ පවතින කාසි ගණනින් දළ දත්තයක් පෙන්වයි
         if active_bg_count == 0 and len(TREND_CACHE) > 0:
             return max(5, int(len(TREND_CACHE) * 0.15))
         return active_bg_count
@@ -255,7 +253,6 @@ def process_single_coin(s, first_win_list_coins, allow_bg_scan, trading_active, 
         
         signal_type = check_5m_indicator_alignment(s, df, zone_status)
         
-        # Background Testing අගය සැමවිටම යාවත්කාලීනව තබා ගැනීමට ඉතිහාසයට එක් කරයි
         if signal_type != "NONE" or (s not in state.get('bg_signal_history', {})):
             with state_lock:
                 if 'bg_signal_history' not in state: state['bg_signal_history'] = {}
@@ -446,7 +443,6 @@ def cron_daily_report_worker():
                     execute_telegram_send(msg)
                     state['daily_stats'] = {'wins': 0, 'loss': 0, 'won_trades': [], 'last_reset_date': str(datetime.date.today())}
                     state['symbol_structure_shift'] = {} 
-                    # පරණ ඩේටා සම්පූර්ණයෙන්ම මකා නොදමා පද්ධතිය ස්ථාවරව තබයි
                 time.sleep(60)
             time.sleep(30)
         except: time.sleep(10)
@@ -502,10 +498,23 @@ def telegram_webhook():
                     f"👉 /add_bl COIN | /remove_bl COIN\n"
                     f"👉 /set_signal_time H:M H:M\n"
                     f"👉 /set_fw_time H:M H:M\n"
+                    f"👉 /check_health 🔍\n"
                     f"👉 /view_lists | /clear_lists | /reset_trades"
                 )
                 execute_telegram_send(menu_msg)
                 
+            # 🔍 SYSTEM SEPARATE MODULE HEALTH CHECKER COMMAND
+            elif cmd == "check_health":
+                health_report = "🔍 <b>SYSTEM CORE MODULE HEALTH REPORT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                tz = pytz.timezone(BOT_TIMEZONE)
+                for thread_name, info in THREAD_STATUS.items():
+                    last_seen_str = "NEVER"
+                    if info["last_seen"] > 0:
+                        dt = datetime.datetime.fromtimestamp(info["last_seen"], tz)
+                        last_seen_str = dt.strftime("%I:%M:%S %p")
+                    health_report += f"⚙️ <b>{thread_name}:</b>\nStatus: {info['status']}\nLast Seen: <code>{last_seen_str}</code>\n\n"
+                execute_telegram_send(health_report)
+
             elif cmd == "bot_on":
                 with state_lock: state['is_scanning'] = True
                 sync_save(); execute_telegram_send("▶️ <b>බොට් ස්කෑනර් එන්ට්‍රීම සක්‍රීය කරන ලදී (ON).</b>")
