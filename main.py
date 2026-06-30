@@ -154,6 +154,7 @@ def get_readable_uptime(start_timestamp):
     parts.append(f"{minutes}m")
     return " ".join(parts)
 
+# --- 3. INDICATORS & MARKET ANALYTICS ---
 TREND_CACHE = {}
 CACHE_DURATION_SEC = 900  
 
@@ -193,12 +194,17 @@ def find_strict_20_bar_fractal(df, side):
     length = len(df)
     if length < 42: return None
     i = length - 21 
+    
     if side == "BUY": 
         current_low = lows[i]
-        if all(current_low < lows[i - j] for j in range(1, 21)) and all(current_low < lows[i + j] for j in range(1, 21)): return current_low
+        # BUY සඳහා: Lower Low එකක් සැකසීම (Left 20, Right 20)
+        if all(current_low < lows[i - j] for j in range(1, 21)) and all(current_low < lows[i + j] for j in range(1, 21)): 
+            return current_low
     elif side == "SELL": 
         current_high = highs[i]
-        if all(current_high > highs[i - j] for j in range(1, 21)) and all(current_high > highs[i + j] for j in range(1, 21)): return current_high
+        # SELL සඳහා: Higher High එකක් සැකසීම (Left 20, Right 20)
+        if all(current_high > highs[i - j] for j in range(1, 21)) and all(current_high > highs[i + j] for j in range(1, 21)): 
+            return current_high
     return None
 
 def is_flat_line_coin(df):
@@ -214,48 +220,85 @@ def is_flat_line_coin(df):
     return False
 
 def check_5m_indicator_alignment(df, zone):
-    if len(df) < 510: return "NONE"
+    if len(df) < 525: return "NONE"
+    
     closes = df['close'].astype(float)
-    ema_60 = closes.ewm(span=60, adjust=False).mean().iloc[-1]
-    ema_80 = closes.ewm(span=80, adjust=False).mean().iloc[-1]
-    ema_500 = closes.ewm(span=500, adjust=False).mean().iloc[-1]
-    if zone == "BUY_ZONE" and (ema_500 > ema_80) and (ema_80 > ema_60):
-        if find_strict_20_bar_fractal(df, "BUY"): return "BUY"
-    elif zone == "SELL_ZONE" and (ema_500 < ema_80) and (ema_80 < ema_60):
-        if find_strict_20_bar_fractal(df, "SELL"): return "SELL"
+    ema_60_series = closes.ewm(span=60, adjust=False).mean()
+    ema_80_series = closes.ewm(span=80, adjust=False).mean()
+    ema_500_series = closes.ewm(span=500, adjust=False).mean()
+    
+    curr_60, prev_60 = ema_60_series.iloc[-1], ema_60_series.iloc[-2]
+    curr_80, prev_80 = ema_80_series.iloc[-1], ema_80_series.iloc[-2]
+    curr_500 = ema_500_series.iloc[-1]
+    
+    latest_close = closes.iloc[-1]
+    
+    # 5M BUY Alignment සහ Breakout පරීක්ෂාව
+    if zone == "BUY_ZONE":
+        if prev_60 <= prev_80 and curr_60 > curr_80 and curr_60 < curr_500:
+            hh_fractal = find_strict_20_bar_fractal(df, "SELL")
+            if hh_fractal is not None and latest_close > hh_fractal:
+                return "BUY"
+                
+    # 5M SELL Alignment සහ Breakout පරීක්ෂාව
+    elif zone == "SELL_ZONE":
+        if prev_60 >= prev_80 and curr_60 < curr_80 and curr_60 > curr_500:
+            ll_fractal = find_strict_20_bar_fractal(df, "BUY")
+            if ll_fractal is not None and latest_close < ll_fractal:
+                return "SELL"
+                
     return "NONE"
 
+# --- 4. TRADING OPERATIONS & SCANNING ---
 def execute_manual_force_scan():
     try:
-        execute_telegram_send("⏳ <b>[MANUAL SCAN STARTED]</b>\nමුළු වෙළඳපොලම පරීක්ෂා කරමින් පවතී. නිම වූ පසු පණිවිඩයක් ලැබෙනු ඇත...")
-        with state_lock:
-            current_margin = state.get('base_margin', 0.80)
-            leverage = state.get('leverage', 10)
-        position_size = current_margin * leverage
-        res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
-        symbols = [t['symbol'] for t in res.json() if t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0 and position_size >= 5.0]
+        execute_telegram_send("⏳ <b>[MANUAL SCAN STARTED]</b>\nඅවම කාසි 50ක් හමුවනතුරු මුළු වෙළඳපොලම අඛණ්ඩව පරීක්ෂා කිරීම ආරම්භ කළා. නිම වූ පසු පණිවිඩයක් ලැබෙනු ඇත...")
         
-        added_count = 0
-        for s in symbols:
+        while True:
             with state_lock:
-                if s in state.get('block_list', []): continue
-                if s in state.get('first_win_list', []): continue
-            zone_status = get_1h_trend_zone(s)
-            try:
-                time.sleep(0.04)
-                k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=600", timeout=10)
-                df = pd.DataFrame(k_res.json(), columns=['t','open','high','low','close','v','ct','qv','nt','tb','tq','i'])
-                if is_flat_line_coin(df): continue
-                signal_type = check_5m_indicator_alignment(df, zone_status)
-                if (zone_status == "SELL_ZONE" and signal_type == "SELL") or (zone_status == "BUY_ZONE" and signal_type == "BUY"):
-                    with state_lock:
-                        if s not in state['first_win_list']:
-                            state['first_win_list'].append(s)
-                            added_count += 1
-            except: pass
-        sync_save()
-        with state_lock: total_coins = len(state['first_win_list'])
-        execute_telegram_send(f"✅ <b>[MANUAL SCAN COMPLETED]</b>\n• අලුතින් එකතු වූ කාසි ගණන: <b>{added_count}</b>\n• මුළු First Win කාසි ගණන: <b>{total_coins}</b>")
+                current_margin = state.get('base_margin', 0.80)
+                leverage = state.get('leverage', 10)
+                current_total_coins = len(state.get('first_win_list', []))
+            
+            # කාසි 50ක් හෝ ඊට වඩා ලැයිස්තුවේ තිබේ නම් ස්කෑන් කිරීම නවත්වන්න
+            if current_total_coins >= 50:
+                break
+                
+            position_size = current_margin * leverage
+            res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
+            symbols = [t['symbol'] for t in res.json() if t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0 and position_size >= 5.0]
+            
+            added_count = 0
+            for s in symbols:
+                with state_lock:
+                    if s in state.get('block_list', []): continue
+                    if s in state.get('first_win_list', []): continue
+                    if len(state['first_win_list']) >= 50: break # මැදදී හෝ 50 පිරුනොත් නවතින්න
+                    
+                zone_status = get_1h_trend_zone(s)
+                try:
+                    time.sleep(0.04)
+                    k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=600", timeout=10)
+                    df = pd.DataFrame(k_res.json(), columns=['t','open','high','low','close','v','ct','qv','nt','tb','tq','i'])
+                    if is_flat_line_coin(df): continue
+                    
+                    signal_type = check_5m_indicator_alignment(df, zone_status)
+                    if (zone_status == "SELL_ZONE" and signal_type == "SELL") or (zone_status == "BUY_ZONE" and signal_type == "BUY"):
+                        with state_lock:
+                            if s not in state['first_win_list']:
+                                state['first_win_list'].append(s)
+                                added_count += 1
+                except: pass
+            
+            sync_save()
+            with state_lock: current_total_coins = len(state['first_win_list'])
+            
+            if current_total_coins < 50:
+                time.sleep(60) # 50 පිරි නොමැති නම් විනාඩියක් ඉඳලා නැවත ස්කෑන් කරයි
+            else:
+                break
+                
+        execute_telegram_send(f"✅ <b>[MANUAL SCAN COMPLETED]</b>\n• ඉලක්කය සපුරා ඇත!\n• මුළු First Win කාසි ගණන: <b>{current_total_coins}</b>")
     except Exception as e:
         execute_telegram_send(f"❌ <b>[SCAN ERROR]</b>\nManual Scan එක අතරතුර දෝෂයක් සිදුවිය: {e}")
 
@@ -385,6 +428,7 @@ def execute_new_recovery_trade(s, side, current_p):
         execute_telegram_send(msg)
     sync_save()
 
+# --- 5. SYSTEM WORKERS & MONITORING ---
 def telegram_reminder_worker():
     while True:
         try:
@@ -454,7 +498,7 @@ def live_monitor_loop():
                             else:
                                 state['symbol_recovery_step'][s] = next_step; state['symbol_accumulated_loss'][s] = current_total_loss
                                 if is_verified and trading_active:
-                                    execute_telegram_send(f"⚠️ <b>STOP LOSS HIT (Step {pos['step']}/3): {s}</b>\nඊළඟ 5M Fractal එකෙන් ਰිකවර් කිරීමට සැකසුම් සූදානම්. ⏳")
+                                    execute_telegram_send(f"⚠️ <b>STOP LOSS HIT (Step {pos['step']}/3): {s}</b>\nඊළඟ 5M Fractal එකෙන් රිකවර් කිරීමට සැකසුම් සූදානම්. ⏳")
                             if s in state['active_positions']: del state['active_positions'][s]
                         sync_save()
                 except Exception as e: print(f"Monitor Loop Asset Error ({s}): {e}")
@@ -483,7 +527,7 @@ def cron_daily_report_worker():
             time.sleep(30)
         except Exception as e: print(f"Daily Report Worker Error: {e}"); time.sleep(10)
 
-# --- 💬 12. TELEGRAM WEBHOOK MANAGER ---
+# --- 6. TELEGRAM WEBHOOK MANAGER ---
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
     try:
@@ -640,7 +684,7 @@ def telegram_webhook():
             # 19. /resume
             elif cmd == "resume":
                 with state_lock: state['is_scanning'] = True
-                sync_save(); execute_telegram_send("▶️ ස්කෑනරය ක්‍රියාත්මක කළා.")
+                sync_save(); execute_telegram_send("▶️ ස්කෑනරය කළා.")
                 return "OK", 200
 
             # 20. /alarm_on
@@ -706,7 +750,7 @@ def telegram_webhook():
                     f"• <code>/add_first [COIN]</code> | <code>/remove_first [COIN]</code>\n"
                     f"• <code>/add_block [COIN]</code> | <code>/remove_block [COIN]</code>\n\n"
                     f"🛠️ <b>3. ට්‍රේඩින් සැකසුම් (Trading Settings)</b>\n"
-                    f"• <code>/set_margin [அગය]</code> - මූලික මාජින් සැකසීම\n"
+                    f"• <code>/set_margin [අගය]</code> - මූලික මාජින් සැකසීම\n"
                     f"• <code>/set_leverage [ගණන]</code> - Leverage සැකසීම\n"
                     f"• <code>/set_sl_pct [අගය]</code> - Stop Loss ප්‍රතිශතය\n"
                     f"• <code>/set_fast_tp_pct [අගය]</code> - Take Profit ප්‍රතිශතය\n"
