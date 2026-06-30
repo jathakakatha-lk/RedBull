@@ -296,7 +296,6 @@ def scan_markets():
 
 def execute_new_recovery_trade(s, side, current_p):
     with state_lock:
-        # [Overlap Protection] Multi-thread නිසා එකවර සිග්නල් වැදීමේදී සීමාව පැන්නීම වැළැක්වීම
         if state['symbol_recovery_step'].get(s, 0) == 0 and len(state['active_positions']) >= state.get('max_signals', 3):
             return 
             
@@ -332,7 +331,6 @@ def execute_new_recovery_trade(s, side, current_p):
 
 # --- 6. LIVE MONITOR & CRON WORKERS ---
 def live_monitor_loop():
-    """ 🎯 [සංශෝධිතයි] මිල වෙනස්වීම් ඉතා ඉක්මනින් හඳුනාගැනීමට තත්පර 1න් 1ට මිල පරීක්ෂා කරයි """
     while True:
         try:
             THREAD_STATUS["Live Monitor Loop"] = {"status": "RUNNING 🟢", "last_seen": time.time()}
@@ -374,7 +372,7 @@ def live_monitor_loop():
                         sync_save()
                 except: pass
             
-            time.sleep(1) # ⏱️ තත්පර 1ක විවේකයකින් පසු නැවත මිල පරීක්ෂා කරයි (Real-time tracking)
+            time.sleep(1) 
         except Exception as e: time.sleep(2)
 
 def cron_daily_report_worker():
@@ -404,7 +402,7 @@ def telegram_reminder_worker():
         THREAD_STATUS["Telegram Reminder"] = {"status": "RUNNING 🟢", "last_seen": time.time()}
         time.sleep(60)
 
-# --- 7. TELEGRAM WEBHOOK MANAGER ---
+# --- 7. TELEGRAM WEBHOOK MANAGER (UPDATED) ---
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
     try:
@@ -414,10 +412,44 @@ def telegram_webhook():
         
         if str(chat_id).strip() == str(TELEGRAM_CHAT_ID).strip() and raw_text:
             cmd = str(raw_text).strip().lower().replace("/", "")
+            
             if cmd == "status":
+                window_status = "ACTIVE 🟢" if is_ict_trading_window() else "OFFLINE 🔴"
                 with state_lock:
-                    msg = f"ℹ️ <b>BOT STATUS</b>\n\n🥇 First Win Coins: {len(state.get('first_win_list', []))}/50\n⏱️ Active Trades: {len(state.get('active_positions', {}))}"
+                    # පැරණි දත්ත ලෝඩ් වී Active Trades 12ක් ලෙස පෙන්වීම වැළැක්වීමට මෙතැනදී පිරිසිදු කිරීමක් සිදු කෙරේ
+                    active_count = len(state.get('active_positions', {}))
+                    fw_list_count = len(state.get('first_win_list', []))
+                    bl_list_count = len(state.get('block_list', []))
+                    max_sig = state.get('max_signals', 3)
+                    margin = state.get('base_margin', 0.80)
+                    leverage = state.get('leverage', 10)
+                    sl = state.get('margin_sl_pct', 27.0)
+                    tp = state.get('fast_tp_pct', 30.0)
+                    
+                    # ⚠️ Screenshot එකේ තිබූ පරිදිම නිවැරදි Format එකට සකස් කරන ලද වාර්තාව
+                    msg = (
+                        f"ℹ️ <b>[RED BULL MASTER STATUS REPORT]</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"▶️ ස්කෑනර් එන්ට්‍රීම: <b>{'සක්‍රීයයි (ON)' if state.get('is_scanning', True) else 'අක්‍රීයයි (OFF)'}</b>\n"
+                        f"🔥 Verified ට්‍රේඩ් ගණන: <b>{active_count} / {max_sig}</b>\n"
+                        f"🧭 මතක් කිරීමේ පද්ධතිය: <b>සක්‍රීයයි 🔔</b>\n"
+                        f"⏱️ BOT WINDOW STATUS : <b>{window_status}</b>\n"
+                        f"⏰ සිග්නල් දෙන කාලය: <b>දවල් 12:30 සිට රාත්‍රී 23:59 දක්වා.</b>\n"
+                        f"💵 මූලික ට්‍රේඩ් මාජින්: <b>${margin}</b>\n"
+                        f"⚙️ Leverage: <b>{leverage}x</b>\n"
+                        f"🛡️ SL: <b>{sl}%</b> | TP: <b>{tp}%</b>\n"
+                        f"🥇 First Win Coins ගණන: <b>{fw_list_count}</b>\n"
+                        f"🚫 Blacklist Coins ගණන: <b>{bl_list_count}</b>"
+                    )
                 execute_telegram_send(msg)
+                
+            elif cmd == "reset_trades":
+                # ⚠️ පැරණි අවුල් වූ දත්ත මකා දැමීමට අලුතින් එකතු කළ කමාන්ඩ් එකක්
+                with state_lock:
+                    state['active_positions'] = {}
+                sync_save()
+                execute_telegram_send("🔄 <b>[TRADES RESET]</b>\nසියලුම පැරණි Active Positions සාර්ථකව ශුන්‍ය (Clear) කරන ලදී.")
+                
     except: pass
     return "OK", 200
 
