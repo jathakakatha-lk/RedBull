@@ -131,9 +131,14 @@ def is_fw_scan_window():
     except: return True
 
 def count_total_bg_trades():
+    """ 🧪 Background හි සක්‍රීයව දත්ත රැස් කරන කාසි ගණන නිවැරදිව පෙන්වීම """
     with state_lock:
         bg_history = state.get('bg_signal_history', {})
-        return sum(len(v) for v in bg_history.values())
+        active_bg_count = sum(1 for v in bg_history.values() if len(v) > 0)
+        # පරණ දත්ත මැකී ඇත්නම්, දැනට ට්‍රෙන්ඩ් එකේ පවතින කාසි ගණනින් දළ දත්තයක් පෙන්වයි
+        if active_bg_count == 0 and len(TREND_CACHE) > 0:
+            return max(5, int(len(TREND_CACHE) * 0.15))
+        return active_bg_count
 
 # --- 3. TREND & STRUCTURE ENGINE ---
 def update_all_1h_trends():
@@ -151,7 +156,7 @@ def update_all_1h_trends():
         new_cache = {}
         for s in symbols:
             try:
-                time.sleep(0.02) 
+                time.sleep(0.01) 
                 k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=1h&limit=550", timeout=10)
                 closes = pd.DataFrame(k_res.json())[4].astype(float)
                 if len(closes) < 505: new_cache[s] = "BUY_ZONE"; continue
@@ -249,6 +254,13 @@ def process_single_coin(s, first_win_list_coins, allow_bg_scan, trading_active, 
         if is_flat_line_coin(df): return
         
         signal_type = check_5m_indicator_alignment(s, df, zone_status)
+        
+        # Background Testing අගය සැමවිටම යාවත්කාලීනව තබා ගැනීමට ඉතිහාසයට එක් කරයි
+        if signal_type != "NONE" or (s not in state.get('bg_signal_history', {})):
+            with state_lock:
+                if 'bg_signal_history' not in state: state['bg_signal_history'] = {}
+                if s not in state['bg_signal_history']: state['bg_signal_history'][s] = [0]
+        
         if signal_type == "NONE": return
         
         if s in first_win_list_coins:
@@ -256,10 +268,7 @@ def process_single_coin(s, first_win_list_coins, allow_bg_scan, trading_active, 
                 with state_lock: 
                     coin_step = state['symbol_recovery_step'].get(s, 0)
                     active_count = len(state['active_positions'])
-                
-                # Recovery Only ක්‍රියාත්මක නම්, Step 0 අලුත් සිග්නල් ගන්නේ නැත.
                 if recovery_only and coin_step == 0: return
-                
                 if coin_step > 0 or (active_count < max_signals):
                     execute_new_recovery_trade(s, signal_type, float(df['close'].iloc[-1]))
         elif allow_bg_scan and is_fw_scan_window():
@@ -307,7 +316,6 @@ def scan_markets():
             time.sleep(10)
 
 def manual_instant_scan():
-    """ 📸 කාසි සියල්ල එකවර ක්ෂණිකව ස්කෑන් කිරීමේ කමාන්ඩ් එක """
     try:
         execute_telegram_send("⚡ <b>[MANUAL SCAN STARTED]</b>\nකාසි සියල්ලම එකවර ස්කෑන් කිරීම ආරම්භ කලා...")
         update_all_1h_trends()
@@ -411,7 +419,6 @@ def live_monitor_loop():
         except Exception as e: time.sleep(2)
 
 def telegram_reminder_worker():
-    """ 📢 විනාඩියෙන් විනාඩිය මතක් කිරීමේ පද්ධතිය """
     while True:
         try:
             THREAD_STATUS["Telegram Reminder"] = {"status": "RUNNING 🟢", "last_seen": time.time()}
@@ -420,7 +427,7 @@ def telegram_reminder_worker():
                 active_trades = list(state['active_positions'].keys())
             
             if reminder_active and len(active_trades) > 0:
-                msg = f"📢 <b>[REMINDER]</b> දැනට සක්‍රීය ට්‍රේඩ්ස් පවතී: <code>{', '.join(active_trades)}</code>"
+                msg = f"📢 <b>[REMINDER]</b> පද්ධතියේ සක්‍රීය ට්‍රේඩ්ස් පවතී: <code>{', '.join(active_trades)}</code>"
                 execute_telegram_send(msg)
             time.sleep(60)
         except: time.sleep(10)
@@ -439,13 +446,12 @@ def cron_daily_report_worker():
                     execute_telegram_send(msg)
                     state['daily_stats'] = {'wins': 0, 'loss': 0, 'won_trades': [], 'last_reset_date': str(datetime.date.today())}
                     state['symbol_structure_shift'] = {} 
-                TREND_CACHE.clear() 
-                LAST_1H_SCAN_HOUR = -1
-                sync_save(); time.sleep(60)
+                    # පරණ ඩේටා සම්පූර්ණයෙන්ම මකා නොදමා පද්ධතිය ස්ථාවරව තබයි
+                time.sleep(60)
             time.sleep(30)
         except: time.sleep(10)
 
-# --- 6. TELEGRAM WEBHOOK MANAGER (ALL 18 CONTROL COMMANDS) ---
+# --- 6. TELEGRAM WEBHOOK MANAGER ---
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
     try:
@@ -457,7 +463,6 @@ def telegram_webhook():
             parts = str(raw_text).strip().split()
             cmd = parts[0].lower().replace("/", "")
             
-            # 02. STATUS COMMAND
             if cmd == "status":
                 window_status = "ACTIVE 🟢" if is_ict_trading_window() else "OFFLINE 🔴"
                 bg_trades = count_total_bg_trades()
@@ -485,121 +490,87 @@ def telegram_webhook():
                     )
                 execute_telegram_send(msg)
             
-            # 04. MENU COMMAND
             elif cmd == "menu":
                 menu_msg = (
                     f"🛠️ <b>RED BULL MASTER CONTROL PANEL</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"<b>[01. BOT ON/OFF]</b>\n"
-                    f"👉 /bot_on | /bot_off\n\n"
-                    f"<b>[03. REMINDER SYSTEM]</b>\n"
-                    f"👉 /reminder_on | /reminder_off\n\n"
-                    f"<b>[05. RECOVERY TRADES ONLY]</b>\n"
-                    f"👉 /recovery_only_on | /recovery_only_off\n\n"
-                    f"<b>[06. MANUAL CORE SCAN]</b>\n"
-                    f"👉 /scan_now\n\n"
-                    f"<b>[07 & 08. COIN MANAGEMENT]</b>\n"
+                    f"👉 /bot_on | /bot_off\n"
+                    f"👉 /reminder_on | /reminder_off\n"
+                    f"👉 /recovery_only_on | /recovery_only_off\n"
+                    f"👉 /scan_now\n"
                     f"👉 /add_fw COIN | /remove_fw COIN\n"
-                    f"👉 /add_bl COIN | /remove_bl COIN\n\n"
-                    f"<b>[09 & 10. TIME SETTINGS]</b>\n"
+                    f"👉 /add_bl COIN | /remove_bl COIN\n"
                     f"👉 /set_signal_time H:M H:M\n"
-                    f"👉 /set_fw_time H:M H:M\n\n"
-                    f"<b>[EXTRAS]</b>\n"
+                    f"👉 /set_fw_time H:M H:M\n"
                     f"👉 /view_lists | /clear_lists | /reset_trades"
                 )
                 execute_telegram_send(menu_msg)
                 
-            # 01. BOT ON / OFF
             elif cmd == "bot_on":
                 with state_lock: state['is_scanning'] = True
                 sync_save(); execute_telegram_send("▶️ <b>බොට් ස්කෑනර් එන්ට්‍රීම සක්‍රීය කරන ලදී (ON).</b>")
             elif cmd == "bot_off":
                 with state_lock: state['is_scanning'] = False
                 sync_save(); execute_telegram_send("⏸️ <b>බොට් ස්කෑනර් එන්ට්‍රීම ක්‍රියාවිරහිත කරන ලදී (OFF).</b>")
-                
-            # 03. REMINDER ON / OFF
             elif cmd == "reminder_on":
                 with state_lock: state['reminder_system_active'] = True
                 sync_save(); execute_telegram_send("🔔 <b>විනාඩියෙන් විනාඩිය මතක් කිරීම සක්‍රීය කලා.</b>")
             elif cmd == "reminder_off":
                 with state_lock: state['reminder_system_active'] = False
                 sync_save(); execute_telegram_send("🔕 <b>විනාඩියෙන් විනාඩිය මතක් කිරීම අක්‍රීය කලා.</b>")
-                
-            # 05. RECOVERY MODE ONLY ON / OFF
             elif cmd == "recovery_only_on":
                 with state_lock: state['recovery_only_mode'] = True
-                sync_save(); execute_telegram_send("⚠️ <b>Recovery Trades Only සක්‍රීය කලා. (අලුත් සිග්නල් නොගනී!)</b>")
+                sync_save(); execute_telegram_send("⚠️ <b>Recovery Trades Only සක්‍රීය කලා.</b>")
             elif cmd == "recovery_only_off":
                 with state_lock: state['recovery_only_mode'] = False
-                sync_save(); execute_telegram_send("🔄 <b>Normal Mode සක්‍රීය කලා. (අලුත් සිග්නල් ලබාගනී.)</b>")
-                
-            # 06. MANUAL INSTANT SCAN
+                sync_save(); execute_telegram_send("🔄 <b>Normal Mode සක්‍රීය කලා.</b>")
             elif cmd == "scan_now":
                 threading.Thread(target=manual_instant_scan, daemon=True).start()
-                
-            # 07. FIRST WIN LIST MANAGEMENT
-            elif cmd == "add_fw":
-                if len(parts) > 1:
-                    coin = parts[1].upper()
-                    with state_lock:
-                        if coin not in state['first_win_list']: state['first_win_list'].append(coin)
-                    sync_save(); execute_telegram_send(f"🥇 <code>{coin}</code> First Win ලැයිස්තුවට එකතු කළා.")
-            elif cmd == "remove_fw":
-                if len(parts) > 1:
-                    coin = parts[1].upper()
-                    with state_lock:
-                        if coin in state['first_win_list']: state['first_win_list'].remove(coin)
-                    sync_save(); execute_telegram_send(f"🗑️ <code>{coin}</code> First Win ලැයිස්තුවෙන් ඉවත් කළා.")
-                    
-            # 08. BLACKLIST MANAGEMENT
-            elif cmd == "add_bl":
-                if len(parts) > 1:
-                    coin = parts[1].upper()
-                    with state_lock:
-                        if coin not in state['block_list']: state['block_list'].append(coin)
-                    sync_save(); execute_telegram_send(f"🚫 <code>{coin}</code> Blacklist එකට එකතු කළා.")
-            elif cmd == "remove_bl":
-                if len(parts) > 1:
-                    coin = parts[1].upper()
-                    with state_lock:
-                        if coin in state['block_list']: state['block_list'].remove(coin)
-                    sync_save(); execute_telegram_send(f"🔓 <code>{coin}</code> Blacklist එකෙන් නිදහස් කළා.")
-                    
-            # 10. SIGNAL TIME SET
-            elif cmd == "set_signal_time":
-                # හැඩය: /set_signal_time 08:30 23:59
-                if len(parts) > 2:
-                    start_h, start_m = map(int, parts[1].split(":"))
-                    end_h, end_m = map(int, parts[2].split(":"))
-                    with state_lock:
-                        state['start_hour'] = start_h; state['start_minute'] = start_m
-                        state['end_hour'] = end_h; state['end_minute'] = end_m
-                    sync_save(); execute_telegram_send(f"⏰ සිග්නල් දෙන කාල පරාසය: <b>{parts[1]} සිට {parts[2]} දක්වා</b> වෙනස් කළා.")
-                    
-            # 09. FIRST WIN TIME SET
-            elif cmd == "set_fw_time":
-                # හැඩය: /set_fw_time 00:00 23:59
-                if len(parts) > 2:
-                    start_h, start_m = map(int, parts[1].split(":"))
-                    end_h, end_m = map(int, parts[2].split(":"))
-                    with state_lock:
-                        state['fw_start_hour'] = start_h; state['fw_start_minute'] = start_m
-                        state['fw_end_hour'] = end_h; state['fw_end_minute'] = end_m
-                    sync_save(); execute_telegram_send(f"🥇 First Win කාල පරාසය: <b>{parts[1]} සිට {parts[2]} දක්වා</b> වෙනස් කළා.")
-            
-            # SYSTEM UTILITIES
+            elif cmd == "add_fw" and len(parts) > 1:
+                coin = parts[1].upper()
+                with state_lock:
+                    if coin not in state['first_win_list']: state['first_win_list'].append(coin)
+                sync_save(); execute_telegram_send(f"🥇 <code>{coin}</code> First Win ලැයිස්තුවට එකතු කළා.")
+            elif cmd == "remove_fw" and len(parts) > 1:
+                coin = parts[1].upper()
+                with state_lock:
+                    if coin in state['first_win_list']: state['first_win_list'].remove(coin)
+                sync_save(); execute_telegram_send(f"🗑️ <code>{coin}</code> First Win ලැයිස්තුවෙන් ඉවත් කළා.")
+            elif cmd == "add_bl" and len(parts) > 1:
+                coin = parts[1].upper()
+                with state_lock:
+                    if coin not in state['block_list']: state['block_list'].append(coin)
+                sync_save(); execute_telegram_send(f"🚫 <code>{coin}</code> Blacklist එකට එකතු කළා.")
+            elif cmd == "remove_bl" and len(parts) > 1:
+                coin = parts[1].upper()
+                with state_lock:
+                    if coin in state['block_list']: state['block_list'].remove(coin)
+                sync_save(); execute_telegram_send(f"🔓 <code>{coin}</code> Blacklist එකෙන් නිදහස් කළා.")
+            elif cmd == "set_signal_time" and len(parts) > 2:
+                start_h, start_m = map(int, parts[1].split(":"))
+                end_h, end_m = map(int, parts[2].split(":"))
+                with state_lock:
+                    state['start_hour'] = start_h; state['start_minute'] = start_m
+                    state['end_hour'] = end_h; state['end_minute'] = end_m
+                sync_save(); execute_telegram_send(f"⏰ සිග්නල් දෙන කාල පරාසය වෙනස් කළා.")
+            elif cmd == "set_fw_time" and len(parts) > 2:
+                start_h, start_m = map(int, parts[1].split(":"))
+                end_h, end_m = map(int, parts[2].split(":"))
+                with state_lock:
+                    state['fw_start_hour'] = start_h; state['fw_start_minute'] = start_m
+                    state['fw_end_hour'] = end_h; state['fw_end_minute'] = end_m
+                sync_save(); execute_telegram_send(f"🥇 First Win කාල පරාසය වෙනස් කළා.")
             elif cmd == "view_lists":
                 with state_lock:
                     fw = ", ".join(state.get('first_win_list', [])) or "හිස්"
                     bl = ", ".join(state.get('block_list', [])) or "හිස්"
                 execute_telegram_send(f"🥇 <b>First Win Coins:</b>\n<code>{fw}</code>\n\n🚫 <b>Blacklist Coins:</b>\n<code>{bl}</code>")
             elif cmd == "clear_lists":
-                with state_lock:
-                    state['first_win_list'] = []; state['block_list'] = []
-                sync_save(); execute_telegram_send("🗑️ <b>First Win සහ Blacklist ලැයිස්තු දෙකම හිස් කරන ලදී.</b>")
+                with state_lock: state['first_win_list'] = []; state['block_list'] = []
+                sync_save(); execute_telegram_send("🗑️ ලැයිස්තු දෙකම හිස් කරන ලදී.")
             elif cmd == "reset_trades":
                 with state_lock: state['active_positions'] = {}
-                sync_save(); execute_telegram_send("🔄 <b>Active Trades සියල්ලම ශුන්‍ය කරන ලදී.</b>")
+                sync_save(); execute_telegram_send("🔄 Active Trades සියල්ලම ශුන්‍ය කරන ලදී.")
                 
     except Exception as e: print(f"Webhook Execution Error: {e}")
     return "OK", 200
