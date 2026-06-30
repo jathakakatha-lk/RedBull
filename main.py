@@ -69,8 +69,8 @@ def load_data():
         'fast_tp_pct': 30.0,            
         'leverage': 10,                 
         
-        'start_hour': 12,
-        'start_minute': 30,
+        'start_hour': 8,
+        'start_minute': 0,
         'end_hour': 23,
         'end_minute': 59,
         
@@ -115,17 +115,16 @@ def is_ict_trading_window():
         tz_now = datetime.datetime.now(tz)
         total_minutes = (tz_now.hour * 60) + tz_now.minute
         with state_lock:
-            start_time = (state.get('start_hour', 12) * 60) + state.get('start_minute', 30)
+            start_time = (state.get('start_hour', 8) * 60) + state.get('start_minute', 0)
             end_time = (state.get('end_hour', 23) * 60) + state.get('end_minute', 59)
         return start_time <= total_minutes <= end_time
     except: return True
 
-def get_readable_uptime(start_timestamp):
-    uptime_seconds = int(time.time() - start_timestamp)
-    days = uptime_seconds // 86400
-    hours = (uptime_seconds % 86400) // 3600
-    minutes = (uptime_seconds % 3600) // 60
-    return f"{days}d {hours}h {minutes}m"
+def count_total_bg_trades():
+    """ 🧪 Background හි ටෙස්ට් වන මුළු කාසි ගණන ගණනය කිරීම """
+    with state_lock:
+        bg_history = state.get('bg_signal_history', {})
+        return sum(len(v) for v in bg_history.values())
 
 # --- 3. TREND FETCHING SYSTEM ---
 def update_all_1h_trends():
@@ -402,7 +401,7 @@ def telegram_reminder_worker():
         THREAD_STATUS["Telegram Reminder"] = {"status": "RUNNING 🟢", "last_seen": time.time()}
         time.sleep(60)
 
-# --- 7. TELEGRAM WEBHOOK MANAGER (UPDATED) ---
+# --- 7. TELEGRAM WEBHOOK MANAGER (ALL COMMANDS FIXES) ---
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
     try:
@@ -415,8 +414,8 @@ def telegram_webhook():
             
             if cmd == "status":
                 window_status = "ACTIVE 🟢" if is_ict_trading_window() else "OFFLINE 🔴"
+                bg_trades = count_total_bg_trades()
                 with state_lock:
-                    # පැරණි දත්ත ලෝඩ් වී Active Trades 12ක් ලෙස පෙන්වීම වැළැක්වීමට මෙතැනදී පිරිසිදු කිරීමක් සිදු කෙරේ
                     active_count = len(state.get('active_positions', {}))
                     fw_list_count = len(state.get('first_win_list', []))
                     bl_list_count = len(state.get('block_list', []))
@@ -426,15 +425,15 @@ def telegram_webhook():
                     sl = state.get('margin_sl_pct', 27.0)
                     tp = state.get('fast_tp_pct', 30.0)
                     
-                    # ⚠️ Screenshot එකේ තිබූ පරිදිම නිවැරදි Format එකට සකස් කරන ලද වාර්තාව
                     msg = (
                         f"ℹ️ <b>[RED BULL MASTER STATUS REPORT]</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                         f"▶️ ස්කෑනර් එන්ට්‍රීම: <b>{'සක්‍රීයයි (ON)' if state.get('is_scanning', True) else 'අක්‍රීයයි (OFF)'}</b>\n"
                         f"🔥 Verified ට්‍රේඩ් ගණන: <b>{active_count} / {max_sig}</b>\n"
-                        f"🧭 මතක් කිරීමේ පද්ධතිය: <b>සක්‍රීයයි 🔔</b>\n"
+                        f"🧪 Background Testing Trades: <b>{bg_trades}</b>\n"
+                        f"📢 මතක් කිරීමේ පද්ධතිය: <b>සක්‍රීයයි 🔔</b>\n"
                         f"⏱️ BOT WINDOW STATUS : <b>{window_status}</b>\n"
-                        f"⏰ සිග්නල් දෙන කාලය: <b>දවල් 12:30 සිට රාත්‍රී 23:59 දක්වා.</b>\n"
+                        f"⏰ සිග්නල් දෙන කාලය: <b>දවල් 8:0 සිට රාත්‍රී 23:59 දක්වා.</b>\n"
                         f"💵 මූලික ට්‍රේඩ් මාජින්: <b>${margin}</b>\n"
                         f"⚙️ Leverage: <b>{leverage}x</b>\n"
                         f"🛡️ SL: <b>{sl}%</b> | TP: <b>{tp}%</b>\n"
@@ -443,8 +442,18 @@ def telegram_webhook():
                     )
                 execute_telegram_send(msg)
                 
+            elif cmd == "menu":
+                # 📜 ඔබ ඉල්ලා සිටි මෙනු ලිස්ට් එක (Menu List)
+                menu_msg = (
+                    f"🛠️ <b>RED BULL MASTER BOT MENU</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"👉 /status - බොට්ගේ වත්මන් වාර්තාව බැලීමට\n"
+                    f"👉 /menu - මෙම මෙනුව ලබාගැනීමට\n"
+                    f"👉 /reset_trades - පරණ අවුල් වූ Active Positions ශුන්‍ය කිරීමට"
+                )
+                execute_telegram_send(menu_msg)
+                
             elif cmd == "reset_trades":
-                # ⚠️ පැරණි අවුල් වූ දත්ත මකා දැමීමට අලුතින් එකතු කළ කමාන්ඩ් එකක්
                 with state_lock:
                     state['active_positions'] = {}
                 sync_save()
