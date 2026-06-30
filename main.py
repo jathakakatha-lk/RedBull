@@ -43,6 +43,7 @@ def load_data():
         'symbol_recovery_step': {},     
         'symbol_accumulated_loss': {},  
         'symbol_last_win_zone': {},     
+        'symbol_structure_shift': {},     # 5m මතකය තබා ගන්නා අලුත් ව්‍යුහය
         'block_list': [],  
         'signal_count': 0, 
         'is_paused': False,
@@ -197,12 +198,10 @@ def find_strict_20_bar_fractal(df, side):
     
     if side == "BUY": 
         current_low = lows[i]
-        # BUY සඳහා: Lower Low එකක් සැකසීම (Left 20, Right 20)
         if all(current_low < lows[i - j] for j in range(1, 21)) and all(current_low < lows[i + j] for j in range(1, 21)): 
             return current_low
     elif side == "SELL": 
         current_high = highs[i]
-        # SELL සඳහා: Higher High එකක් සැකසීම (Left 20, Right 20)
         if all(current_high > highs[i - j] for j in range(1, 21)) and all(current_high > highs[i + j] for j in range(1, 21)): 
             return current_high
     return None
@@ -219,7 +218,7 @@ def is_flat_line_coin(df):
     if len(set(df['close'].astype(float).iloc[-15:].tolist())) <= 3: return True
     return False
 
-def check_5m_indicator_alignment(df, zone):
+def check_5m_indicator_alignment(symbol, df, zone):
     if len(df) < 525: return "NONE"
     
     closes = df['close'].astype(float)
@@ -227,25 +226,75 @@ def check_5m_indicator_alignment(df, zone):
     ema_80_series = closes.ewm(span=80, adjust=False).mean()
     ema_500_series = closes.ewm(span=500, adjust=False).mean()
     
-    curr_60, prev_60 = ema_60_series.iloc[-1], ema_60_series.iloc[-2]
-    curr_80, prev_80 = ema_80_series.iloc[-1], ema_80_series.iloc[-2]
+    curr_60 = ema_60_series.iloc[-1]
+    curr_80 = ema_80_series.iloc[-1]
     curr_500 = ema_500_series.iloc[-1]
     
     latest_close = closes.iloc[-1]
     
-    # 5M BUY Alignment සහ Breakout පරීක්ෂාව
+    # මතක පද්ධතිය ආරම්භ කිරීම
+    with state_lock:
+        if 'symbol_structure_shift' not in state:
+            state['symbol_structure_shift'] = {}
+        current_shift_state = state['symbol_structure_shift'].get(symbol, "NONE")
+    
+    # 🟢 --- 5M BUY LOGIC ---
     if zone == "BUY_ZONE":
-        if prev_60 <= prev_80 and curr_60 > curr_80 and curr_60 < curr_500:
-            hh_fractal = find_strict_20_bar_fractal(df, "SELL")
-            if hh_fractal is not None and latest_close > hh_fractal:
-                return "BUY"
+        # පියවර 1: 500 යටදී 80 කපාගෙන 60 ඉහළ යාම (Alignment)
+        if curr_60 > curr_80 and curr_60 < curr_500:
+            
+            # පියවර 2: HH (SELL Fractal) එකක් Break කිරීම පරීක්ෂාව
+            if current_shift_state == "NONE":
+                hh_fractal = find_strict_20_bar_fractal(df, "SELL")
+                if hh_fractal is not None and latest_close > hh_fractal:
+                    with state_lock:
+                        state['symbol_structure_shift'][symbol] = "HH_BROKEN"
+                    sync_save()
+            
+            # පියවර 3: HH බිඳ වැටුණු පසු අලුතින් LL (BUY Fractal) එකක් සෑදුනේදැයි බැලීම
+            elif current_shift_state == "HH_BROKEN":
+                ll_fractal = find_strict_20_bar_fractal(df, "BUY")
+                if ll_fractal is not None:
+                    # කොන්දේසි සියල්ල සම්පූර්ණයි! මතකය සාර්ථකව Reset කර සිග්නල් එක ලබා දෙයි.
+                    with state_lock:
+                        state['symbol_structure_shift'][symbol] = "NONE"
+                    sync_save()
+                    return "BUY"
+        else:
+            # EMA මාරු වුවහොත් මතකය Reset කරයි
+            if current_shift_state != "NONE":
+                with state_lock:
+                    state['symbol_structure_shift'][symbol] = "NONE"
+                sync_save()
                 
-    # 5M SELL Alignment සහ Breakout පරීක්ෂාව
+    # 🔴 --- 5M SELL LOGIC ---
     elif zone == "SELL_ZONE":
-        if prev_60 >= prev_80 and curr_60 < curr_80 and curr_60 > curr_500:
-            ll_fractal = find_strict_20_bar_fractal(df, "BUY")
-            if ll_fractal is not None and latest_close < ll_fractal:
-                return "SELL"
+        # පියවර 1: 500 උඩදී 80 කපාගෙන 60 පහළ යාම (Alignment)
+        if curr_60 < curr_80 and curr_60 > curr_500:
+            
+            # පියවර 2: LL (BUY Fractal) එකක් Break කිරීම පරීක්ෂාව
+            if current_shift_state == "NONE":
+                ll_fractal = find_strict_20_bar_fractal(df, "BUY")
+                if ll_fractal is not None and latest_close < ll_fractal:
+                    with state_lock:
+                        state['symbol_structure_shift'][symbol] = "LL_BROKEN"
+                    sync_save()
+            
+            # පියවර 3: LL බිඳ වැටුණු පසු අලුතින් HH (SELL Fractal) එකක් සෑදුනේදැයි බැලීම
+            elif current_shift_state == "LL_BROKEN":
+                hh_fractal = find_strict_20_bar_fractal(df, "SELL")
+                if hh_fractal is not None:
+                    # කොන්දේසි සියල්ල සම්පූර්ණයි!
+                    with state_lock:
+                        state['symbol_structure_shift'][symbol] = "NONE"
+                    sync_save()
+                    return "SELL"
+        else:
+            # EMA මාරු වුවහොත් මතකය Reset කරයි
+            if current_shift_state != "NONE":
+                with state_lock:
+                    state['symbol_structure_shift'][symbol] = "NONE"
+                sync_save()
                 
     return "NONE"
 
@@ -260,7 +309,6 @@ def execute_manual_force_scan():
                 leverage = state.get('leverage', 10)
                 current_total_coins = len(state.get('first_win_list', []))
             
-            # කාසි 50ක් හෝ ඊට වඩා ලැයිස්තුවේ තිබේ නම් ස්කෑන් කිරීම නවත්වන්න
             if current_total_coins >= 50:
                 break
                 
@@ -273,7 +321,7 @@ def execute_manual_force_scan():
                 with state_lock:
                     if s in state.get('block_list', []): continue
                     if s in state.get('first_win_list', []): continue
-                    if len(state['first_win_list']) >= 50: break # මැදදී හෝ 50 පිරුනොත් නවතින්න
+                    if len(state['first_win_list']) >= 50: break
                     
                 zone_status = get_1h_trend_zone(s)
                 try:
@@ -282,7 +330,7 @@ def execute_manual_force_scan():
                     df = pd.DataFrame(k_res.json(), columns=['t','open','high','low','close','v','ct','qv','nt','tb','tq','i'])
                     if is_flat_line_coin(df): continue
                     
-                    signal_type = check_5m_indicator_alignment(df, zone_status)
+                    signal_type = check_5m_indicator_alignment(s, df, zone_status)
                     if (zone_status == "SELL_ZONE" and signal_type == "SELL") or (zone_status == "BUY_ZONE" and signal_type == "BUY"):
                         with state_lock:
                             if s not in state['first_win_list']:
@@ -294,7 +342,7 @@ def execute_manual_force_scan():
             with state_lock: current_total_coins = len(state['first_win_list'])
             
             if current_total_coins < 50:
-                time.sleep(60) # 50 පිරි නොමැති නම් විනාඩියක් ඉඳලා නැවත ස්කෑන් කරයි
+                time.sleep(60)
             else:
                 break
                 
@@ -347,7 +395,7 @@ def scan_markets():
                         k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=600", timeout=10)
                         df = pd.DataFrame(k_res.json(), columns=['t','open','high','low','close','v','ct','qv','nt','tb','tq','i'])
                         if is_flat_line_coin(df): continue
-                        signal_type = check_5m_indicator_alignment(df, zone_status)
+                        signal_type = check_5m_indicator_alignment(s, df, zone_status)
                         if signal_type == "NONE": continue
                         
                         execute_trade = False
@@ -684,7 +732,7 @@ def telegram_webhook():
             # 19. /resume
             elif cmd == "resume":
                 with state_lock: state['is_scanning'] = True
-                sync_save(); execute_telegram_send("▶️ ස්කෑනරය කළා.")
+                sync_save(); execute_telegram_send("▶️ ස්කෑනරය නැවත පණගැන්වූවා.")
                 return "OK", 200
 
             # 20. /alarm_on
