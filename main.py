@@ -35,7 +35,9 @@ THREAD_STATUS = {
 }
 
 TREND_CACHE = {} 
+VOLUME_CACHE = {}  
 LAST_1H_SCAN_HOUR = -1
+IS_BTC_CRASHING = False  
 
 # --- 2. STATE MANAGEMENT & DATABASE ---
 def load_data():
@@ -74,7 +76,8 @@ def load_data():
         'fw_start_hour': 0, 'fw_start_minute': 0,
         'fw_end_hour': 23, 'fw_end_minute': 59,
         
-        'force_scan_until': 0.0  
+        'force_scan_until': 0.0,
+        'min_24h_volume_mln': 15.0  
     }
     
     db_dir = os.path.dirname(DB_FILE)
@@ -139,9 +142,26 @@ def count_total_bg_trades():
             return 639
         return active_bg_count
 
-# --- 3. TREND & STRUCTURE ENGINE ---
+# --- 3. TREND, BTC CORRELATION & STRUCTURE ENGINE ---
+def check_btc_status():
+    global IS_BTC_CRASHING
+    try:
+        res = requests.get("https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=5m&limit=2", timeout=10)
+        k_data = res.json()
+        if isinstance(k_data, list) and len(k_data) >= 2:
+            open_p = float(k_data[-1][1])
+            low_p = float(k_data[-1][3])
+            drop_pct = ((open_p - low_p) / open_p) * 100.0
+            if drop_pct >= 1.5:
+                if not IS_BTC_CRASHING:
+                    execute_telegram_send("⚠️ <b>[BTC CRASH WARNING]</b>\nBTC අධික ලෙස පහළ යයි! නව ට්‍රේඩ්ස් තාවකාලිකව අත්හිටුවයි.")
+                IS_BTC_CRASHING = True
+                return
+        IS_BTC_CRASHING = False
+    except: pass
+
 def update_all_1h_trends():
-    global TREND_CACHE, LAST_1H_SCAN_HOUR
+    global TREND_CACHE, VOLUME_CACHE, LAST_1H_SCAN_HOUR
     tz = pytz.timezone(BOT_TIMEZONE)
     current_hour = datetime.datetime.now(tz).hour
     
@@ -155,9 +175,18 @@ def update_all_1h_trends():
         if not isinstance(data, list):
             return
             
-        symbols = [t['symbol'] for t in data if isinstance(t, dict) and 'symbol' in t and t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0]
-        
         new_cache = {}
+        new_vol_cache = {}
+        symbols = []
+        
+        for t in data:
+            if isinstance(t, dict) and 'symbol' in t and t['symbol'].endswith("USDT"):
+                s = t['symbol']
+                vol_quote = float(t.get('quoteVolume', 0)) 
+                new_vol_cache[s] = vol_quote / 1_000_000.0 
+                if float(t.get('lastPrice', 0)) > 0:
+                    symbols.append(s)
+        
         for s in symbols:
             try:
                 time.sleep(0.01) 
@@ -181,16 +210,17 @@ def update_all_1h_trends():
             
         if new_cache:
             TREND_CACHE = new_cache
+            VOLUME_CACHE = new_vol_cache
             LAST_1H_SCAN_HOUR = current_hour
     except Exception as e: print(f"1H Batch Scan Error: {e}")
 
 def find_strict_20_bar_fractal(df, side):
     highs = df['high'].astype(float).tolist()
     lows = df['low'].astype(float).tolist()
-    if len(df) < 42: return None
-    i = len(df) - 21 
-    if side == "BUY" and all(lows[i] < lows[i - j] for j in range(1, 21)) and all(lows[i] < lows[i + j] for j in range(1, 21)): return lows[i]
-    if side == "SELL" and all(highs[i] > highs[i - j] for j in range(1, 21)) and all(highs[i] > highs[i + j] for j in range(1, 21)): return highs[i]
+    if len(df) < 15: return None
+    i = len(df) - 6 
+    if side == "BUY" and all(lows[i] < lows[i - j] for j in range(1, 6)) and all(lows[i] < lows[i + j] for j in range(1, 6)): return lows[i]
+    if side == "SELL" and all(highs[i] > highs[i - j] for j in range(1, 6)) and all(highs[i] > highs[i + j] for j in range(1, 6)): return highs[i]
     return None
 
 def is_flat_line_coin(df):
@@ -238,7 +268,8 @@ def update_background_simulation(symbol, signal_side, df):
         sim_tp = current_p * (1.0 + 0.03) if signal_side == "BUY" else current_p * (1.0 - 0.03)
         sim_sl = current_p * (1.0 - 0.027) if signal_side == "BUY" else current_p * (1.0 + 0.027)
         
-        res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=5m&limit=12", timeout=10)
+        # දීර්ඝ කාලීන සත්‍යාපනය සඳහා API උපරිම දත්ත (කැන්ඩල් 1000) ලබා ගැනීම
+        res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=5m&limit=1000", timeout=10)
         candles = res.json()
         if not isinstance(candles, list): return
         
@@ -255,12 +286,16 @@ def update_background_simulation(symbol, signal_side, df):
             if len(state['bg_signal_history'][symbol]) > 3: state['bg_signal_history'][symbol].pop(0)
             if sum(state['bg_signal_history'][symbol]) >= 1 and symbol not in state['first_win_list'] and len(state['first_win_list']) < 50:
                 state['first_win_list'].append(symbol)
-                execute_telegram_send(f"🥇 <b>[COIN FILTERED]</b>\n<code>{symbol}</code> First Win ลැයිස්තුවට ඇතුළත් කළා.")
+                execute_telegram_send(f"🥇 <b>[COIN FILTERED]</b>\n<code>{symbol}</code> දීර්ඝ කාලීන First Win ලැයිස්තුවට ඇතුළත් කළා.")
     except: pass
 
 # --- 4. CORE SCANNER ENGINE ---
 def process_single_coin(s, first_win_list_coins, allow_bg_scan, trading_active, max_signals, recovery_only, direct_mode):
     try:
+        coin_vol = VOLUME_CACHE.get(s, 0.0)
+        min_vol_required = state.get('min_24h_volume_mln', 15.0)
+        if coin_vol < min_vol_required: return
+
         zone_status = TREND_CACHE.get(s, "BUY_ZONE")
         k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=530", timeout=10)
         k_data = k_res.json()
@@ -277,7 +312,8 @@ def process_single_coin(s, first_win_list_coins, allow_bg_scan, trading_active, 
                 if s not in state['bg_signal_history']: state['bg_signal_history'][s] = [0]
         
         if signal_type == "NONE": return
-        
+        if IS_BTC_CRASHING: return
+
         if direct_mode:
             if trading_active:
                 with state_lock:
@@ -311,6 +347,7 @@ def scan_markets():
                 time.sleep(5)
                 continue
                 
+            check_btc_status()  
             update_all_1h_trends() 
             trading_active = is_ict_trading_window()
             
@@ -346,6 +383,7 @@ def scan_markets():
 def manual_instant_scan():
     try:
         execute_telegram_send("⚡ <b>[MANUAL SCAN STARTED]</b>\nකාසි සියල්ලම එකවර ස්කෑන් කිරීම ආරම්භ කලා...")
+        check_btc_status()
         update_all_1h_trends()
         trading_active = is_ict_trading_window()
         with state_lock:
@@ -405,6 +443,7 @@ def execute_new_recovery_trade(s, side, current_p):
            f"🛑 {round(initial_sl, 5)} :Stop Loss Price\n\n"
            f"📈 Recovery Step: <b>{step}/3</b>\n"
            f"🛡️ Protection SL: <b>{round(sl_margin_pct, 1)}% (${round(protection_sl_cash, 3)})</b>\n"
+           f"📊 24h Vol: <b>{round(VOLUME_CACHE.get(s, 0.0), 1)}M USDT</b>\n"
            f"📊 Accumulated Loss: <b>${round(accumulated_loss, 3)}</b>\n\n"
            f"Mr. MASTER(PRcoding)👑")
            
@@ -502,14 +541,10 @@ def cron_daily_report_worker():
 
 # --- 6. HELPER FOR AUTOMATIC TIME PERIODS ---
 def get_time_period_name(hour):
-    if 4 <= hour < 12:
-        return "උදේ"
-    elif 12 <= hour < 16:
-        return "දවල්"
-    elif 16 <= hour < 19:
-        return "සවස"
-    else:
-        return "රාත්‍රී"
+    if 4 <= hour < 12: return "උදේ"
+    elif 12 <= hour < 16: return "දවල්"
+    elif 16 <= hour < 19: return "සවස"
+    else: return "රාත්‍රී"
 
 # --- 7. TELEGRAM WEBHOOK MANAGER ---
 @app.route('/webhook', methods=['POST'])
@@ -533,7 +568,6 @@ def telegram_webhook():
                     
                     start_period = get_time_period_name(state.get('start_hour', 8))
                     end_period = get_time_period_name(state.get('end_hour', 23))
-                    
                     fw_start_period = get_time_period_name(state.get('fw_start_hour', 0))
                     fw_end_period = get_time_period_name(state.get('fw_end_hour', 23))
                     
@@ -547,6 +581,8 @@ def telegram_webhook():
                         f"⚙️ Mode: <b>{'RECOVERY ONLY ⚠️' if state.get('recovery_only_mode', False) else 'NORMAL MODE 🔄'}</b>\n"
                         f"⚡ Direct Signal Mode: <b>{'සක්‍රීයයි 🔥 [DIRECT]' if state.get('direct_signal_mode', False) else 'අක්‍රීයයි 🛡️ [FW FILTER]'}</b>\n"
                         f"⏱️ BOT WINDOW STATUS : <b>{window_status}</b>\n"
+                        f"🛡️ BTC Crash Filter: <b>{'ALERT 🔴 (STOPPED)' if IS_BTC_CRASHING else 'STABLE 🟢'}</b>\n"
+                        f"📊 Min 24h Vol Filter: <b>&gt; ${state.get('min_24h_volume_mln', 15.0)}M</b>\n"
                         f"⏰ සිග්නල් දෙන කාලය: <b>{start_period} {state.get('start_hour', 8)}:{state.get('start_minute', 0)} සිට {end_period} {state.get('end_hour', 23)}:{state.get('end_minute', 59)} දක්වා.</b>\n"
                         f"🥇 First Win කාලය: <b>{fw_start_period} {state.get('fw_start_hour', 0)}:{state.get('fw_start_minute', 0)} සිට {fw_end_period} {state.get('fw_end_hour', 23)}:{state.get('fw_end_minute', 59)} දක්වා.</b>\n"
                         f"💵 මූලික ට්‍රේඩ් මාජින්: <b>${state.get('base_margin', 0.80)}</b>\n"
@@ -632,7 +668,7 @@ def telegram_webhook():
                 coin_val = parts[1].upper()
                 with state_lock:
                     if coin_val not in state['first_win_list']: state['first_win_list'].append(coin_val)
-                sync_save(); execute_telegram_send(f"🥇 <code>{coin_val}</code> First Win ලැයිස්තුවට එකතු කළා.")
+                sync_save(); execute_telegram_send(f"🥇 <code>{coin_val}</code> First Win ลැයිස්තුවට එකතු කළා.")
             elif cmd == "remove_fw" and len(parts) > 1:
                 coin_val = parts[1].upper()
                 with state_lock:
