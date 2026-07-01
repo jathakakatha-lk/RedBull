@@ -152,7 +152,6 @@ def update_all_1h_trends():
         res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
         data = res.json()
         
-        # විසඳුම 2: API එකෙන් එන දත්ත බලාපොරොත්තු වන ආකෘතියේ නොවේ නම් සරලව මඟහැරීම
         if not isinstance(data, list):
             return
             
@@ -256,7 +255,7 @@ def update_background_simulation(symbol, signal_side, df):
             if len(state['bg_signal_history'][symbol]) > 3: state['bg_signal_history'][symbol].pop(0)
             if sum(state['bg_signal_history'][symbol]) >= 1 and symbol not in state['first_win_list'] and len(state['first_win_list']) < 50:
                 state['first_win_list'].append(symbol)
-                execute_telegram_send(f"🥇 <b>[COIN FILTERED]</b>\n<code>{symbol}</code> First Win ලැයිස්තුවට ඇතුළත් කළා.")
+                execute_telegram_send(f"🥇 <b>[COIN FILTERED]</b>\n<code>{symbol}</code> First Win ลැයිස්තුවට ඇතුළත් කළා.")
     except: pass
 
 # --- 4. CORE SCANNER ENGINE ---
@@ -538,7 +537,6 @@ def telegram_webhook():
                     fw_start_period = get_time_period_name(state.get('fw_start_hour', 0))
                     fw_end_period = get_time_period_name(state.get('fw_end_hour', 23))
                     
-                    # විසඳුම 1: f-string එක ඇතුළේ තිබූ escape sequence (\|) එක ඉවත් කිරීම
                     msg = (
                         f"ℹ️ <b>[RED BULL MASTER STATUS REPORT]</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -631,25 +629,25 @@ def telegram_webhook():
             elif cmd == "scan_now":
                 threading.Thread(target=manual_instant_scan, daemon=True).start()
             elif cmd == "add_fw" and len(parts) > 1:
-                coin = parts[1].upper()
+                coin_val = parts[1].upper()
                 with state_lock:
-                    if coin not in state['first_win_list']: state['first_win_list'].append(coin)
-                sync_save(); execute_telegram_send(f"🥇 <code>{coin}</code> First Win ලැයිස්තුවට එකතු කළා.")
-            elif coin == "remove_fw" and len(parts) > 1:
-                coin = parts[1].upper()
+                    if coin_val not in state['first_win_list']: state['first_win_list'].append(coin_val)
+                sync_save(); execute_telegram_send(f"🥇 <code>{coin_val}</code> First Win ලැයිස්තුවට එකතු කළා.")
+            elif cmd == "remove_fw" and len(parts) > 1:
+                coin_val = parts[1].upper()
                 with state_lock:
-                    if coin in state['first_win_list']: state['first_win_list'].remove(coin)
-                sync_save(); execute_telegram_send(f"🗑️ <code>{coin}</code> First Win ලැයිස්තුවෙන් ඉවත් කළා.")
+                    if coin_val in state['first_win_list']: state['first_win_list'].remove(coin_val)
+                sync_save(); execute_telegram_send(f"🗑️ <code>{coin_val}</code> First Win ලැයිස්තුවෙන් ඉවත් කළා.")
             elif cmd == "add_bl" and len(parts) > 1:
-                coin = parts[1].upper()
+                coin_val = parts[1].upper()
                 with state_lock:
-                    if coin not in state['block_list']: state['block_list'].append(coin)
-                sync_save(); execute_telegram_send(f"🚫 <code>{coin}</code> Blacklist එකට එකතු කළා.")
+                    if coin_val not in state['block_list']: state['block_list'].append(coin_val)
+                sync_save(); execute_telegram_send(f"🚫 <code>{coin_val}</code> Blacklist එකට එකතු කළා.")
             elif cmd == "remove_bl" and len(parts) > 1:
-                coin = parts[1].upper()
+                coin_val = parts[1].upper()
                 with state_lock:
-                    if coin in state['block_list']: state['block_list'].remove(coin)
-                sync_save(); execute_telegram_send(f"🔓 <code>{coin}</code> Blacklist එකෙන් නිදහස් කළා.")
+                    if coin_val in state['block_list']: state['block_list'].remove(coin_val)
+                sync_save(); execute_telegram_send(f"🔓 <code>{coin_val}</code> Blacklistෙන් නිදහස් කළා.")
             elif cmd == "set_signal_time" and len(parts) > 2:
                 start_h, start_m = map(int, parts[1].split(":"))
                 end_h, end_m = map(int, parts[2].split(":"))
