@@ -58,6 +58,7 @@ def load_data():
         'pending_acknowledgement': False,      
         'reminder_system_active': True,
         'recovery_only_mode': False,     
+        'direct_signal_mode': False,    # නවීකරණය: Direct Mode සඳහා State එක (Default is False)
         
         'first_win_list': [],           
         'shared_loss_buffer': 0.0,       
@@ -151,7 +152,6 @@ def update_all_1h_trends():
         res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
         data = res.json()
         
-        # බයිනෑන්ස් එකෙන් ආපු දත්ත List එකක් නෙවේ නම් ස්කෑන් කිරීම නතර කරයි
         if not isinstance(data, list):
             print(f"1H Batch Scan Warning: Expected list from API, got {type(data)}")
             return
@@ -260,7 +260,7 @@ def update_background_simulation(symbol, signal_side, df):
     except: pass
 
 # --- 4. CORE SCANNER ENGINE ---
-def process_single_coin(s, first_win_list_coins, allow_bg_scan, trading_active, max_signals, recovery_only):
+def process_single_coin(s, first_win_list_coins, allow_bg_scan, trading_active, max_signals, recovery_only, direct_mode):
     try:
         zone_status = TREND_CACHE.get(s, "BUY_ZONE")
         k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=530", timeout=10)
@@ -279,6 +279,18 @@ def process_single_coin(s, first_win_list_coins, allow_bg_scan, trading_active, 
         
         if signal_type == "NONE": return
         
+        # නවීකරණය: Direct Signal Mode සක්‍රීය නම් FW List නොබලා කෙලින්ම සිග්නල් නිකුත් කිරීම
+        if direct_mode:
+            if trading_active:
+                with state_lock:
+                    coin_step = state['symbol_recovery_step'].get(s, 0)
+                    active_count = len(state['active_positions'])
+                if recovery_only and coin_step == 0: return
+                if coin_step > 0 or (active_count < max_signals):
+                    execute_new_recovery_trade(s, signal_type, float(df['close'].iloc[-1]))
+            return
+
+        # සාමාන්‍ය පියවර (Default Flow)
         if s in first_win_list_coins:
             if trading_active:
                 with state_lock: 
@@ -310,6 +322,7 @@ def scan_markets():
                 bot_paused = state.get('is_paused', False)
                 max_signals = state.get('max_signals', 3)
                 recovery_only = state.get('recovery_only_mode', False)
+                direct_mode = state.get('direct_signal_mode', False)
                 first_win_list_coins = list(state.get('first_win_list', []))
                 
             if is_scanning and not bot_paused:
@@ -324,9 +337,9 @@ def scan_markets():
                             if s in state.get('block_list', []): continue
                             with state_lock:
                                 if s in state['active_positions']: continue
-                            if (s not in first_win_list_coins) and (not allow_bg_scan): continue
+                            if (not direct_mode) and (s not in first_win_list_coins) and (not allow_bg_scan): continue
                             
-                            executor.submit(process_single_coin, s, first_win_list_coins, allow_bg_scan, trading_active, max_signals, recovery_only)
+                            executor.submit(process_single_coin, s, first_win_list_coins, allow_bg_scan, trading_active, max_signals, recovery_only, direct_mode)
                         
             sync_save()
             time.sleep(50) 
@@ -341,6 +354,7 @@ def manual_instant_scan():
         with state_lock:
             max_signals = state.get('max_signals', 3)
             recovery_only = state.get('recovery_only_mode', False)
+            direct_mode = state.get('direct_signal_mode', False)
             first_win_list_coins = list(state.get('first_win_list', []))
             
         allow_bg_scan = (len(first_win_list_coins) < 50)
@@ -354,7 +368,7 @@ def manual_instant_scan():
                     if s in state.get('block_list', []): continue
                     with state_lock:
                         if s in state['active_positions']: continue
-                    executor.submit(process_single_coin, s, first_win_list_coins, allow_bg_scan, trading_active, max_signals, recovery_only)
+                    executor.submit(process_single_coin, s, first_win_list_coins, allow_bg_scan, trading_active, max_signals, recovery_only, direct_mode)
         execute_telegram_send("🎯 <b>[MANUAL SCAN COMPLETED]</b>\nසියලුම කාසි ස්කෑන් කර අවසන් කරන ලදී!")
     except Exception as e:
         execute_telegram_send(f"❌ ස්කෑන් කිරීමේදී දෝෂයක්: {e}")
@@ -384,12 +398,19 @@ def execute_new_recovery_trade(s, side, current_p):
         }
         state['signal_count'] += 1
         sig_id = state['signal_count']
+    
+    protection_sl_cash = current_margin * (sl_margin_pct / 100.0)
         
     msg = (f"🔔 <b>NEW SIGNAL #{sig_id}</b> 🚨\n\n"
-           f"📍 Symbol: <code>{s}</code> | Side: <b>{side}</b>\n"
-           f"🎯 Target TP: <code>{round(initial_tp, 5)}</code>\n"
-           f"🛑 Stop Loss: <code>{round(initial_sl, 5)}</code>\n\n"
-           f"📈 Step: <b>{step}/3</b> | Mr. MASTER👑")
+           f"📍 Symbol: <b>{s}</b> | Side: <b>{side}</b>\n"
+           f"💵 Base Margin: <b>${round(current_margin, 2)} ({leverage}x)</b>\n"
+           f"🎯 Target TP Price: <b>{round(initial_tp, 5)}</b>\n"
+           f"🛑 {round(initial_sl, 5)} :Stop Loss Price\n\n"
+           f"📈 Recovery Step: <b>{step}/3</b>\n"
+           f"🛡️ Protection SL: <b>{round(sl_margin_pct, 1)}% (${round(protection_sl_cash, 3)})</b>\n"
+           f"📊 Accumulated Loss: <b>${round(accumulated_loss, 3)}</b>\n\n"
+           f"Mr. MASTER(PRcoding)👑")
+           
     execute_telegram_send(msg)
     sync_save()
 
@@ -412,6 +433,10 @@ def live_monitor_loop():
                     if TREND_CACHE.get(s, "BUY_ZONE") != pos.get("initial_1h_zone"):
                         with state_lock:
                             state['symbol_recovery_step'][s] = state['symbol_recovery_step'].get(s, 0) + 1 
+                            current_margin = state.get('base_margin', 0.80)
+                            sl_margin_pct = state.get('margin_sl_pct', 27.0)
+                            loss_amount = current_margin * (sl_margin_pct / 100.0)
+                            state['symbol_accumulated_loss'][s] = state['symbol_accumulated_loss'].get(s, 0.0) + loss_amount
                             if s in state['active_positions']: del state['active_positions'][s]
                         execute_telegram_send(f"🔄 <b>1H ZONE FLIPPED: {s}</b>"); sync_save(); continue
                         
@@ -425,10 +450,16 @@ def live_monitor_loop():
                     elif (pos['side'] == "BUY" and current_p <= pos['sl']) or (pos['side'] == "SELL" and current_p >= pos['sl']):
                         with state_lock:
                             next_step = pos['step'] + 1
+                            current_margin = state.get('base_margin', 0.80)
+                            sl_margin_pct = state.get('margin_sl_pct', 27.0)
+                            loss_amount = current_margin * (sl_margin_pct / 100.0)
+                            state['symbol_accumulated_loss'][s] = state['symbol_accumulated_loss'].get(s, 0.0) + loss_amount
+                            
                             if next_step >= 4: 
                                 if s not in state['block_list']: state['block_list'].append(s)
                                 if s in state.get('first_win_list', []): state['first_win_list'].remove(s)
                                 state['symbol_recovery_step'][s] = 0
+                                state['symbol_accumulated_loss'][s] = 0.0
                                 state['daily_stats']['loss'] += 1
                                 execute_telegram_send(f"❌ <b>RECOVERY FAILED: {s}</b>")
                             else:
@@ -472,7 +503,18 @@ def cron_daily_report_worker():
             time.sleep(30)
         except: time.sleep(10)
 
-# --- 6. TELEGRAM WEBHOOK MANAGER ---
+# --- 6. HELPER FOR AUTOMATIC TIME PERIODS ---
+def get_time_period_name(hour):
+    if 4 <= hour < 12:
+        return "උදේ"
+    elif 12 <= hour < 16:
+        return "දවල්"
+    elif 16 <= hour < 19:
+        return "සවස"
+    else:
+        return "රාත්‍රී"
+
+# --- 7. TELEGRAM WEBHOOK MANAGER ---
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
     try:
@@ -492,6 +534,12 @@ def telegram_webhook():
                     fw_list_count = len(state.get('first_win_list', []))
                     bl_list_count = len(state.get('block_list', []))
                     
+                    start_period = get_time_period_name(state.get('start_hour', 8))
+                    end_period = get_time_period_name(state.get('end_hour', 23))
+                    
+                    fw_start_period = get_time_period_name(state.get('fw_start_hour', 0))
+                    fw_end_period = get_time_period_name(state.get('fw_end_hour', 23))
+                    
                     msg = (
                         f"ℹ️ <b>[RED BULL MASTER STATUS REPORT]</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -500,12 +548,13 @@ def telegram_webhook():
                         f"🧪 Background Testing Trades: <b>{bg_trades}</b>\n"
                         f"📢 මතක් කිරීමේ පද්ධතිය: <b>{'සක්‍රීයයි 🔔' if state.get('reminder_system_active', True) else 'අක්‍රීයයි 🔕'}</b>\n"
                         f"⚙️ Mode: <b>{'RECOVERY ONLY ⚠️' if state.get('recovery_only_mode', False) else 'NORMAL MODE 🔄'}</b>\n"
+                        f"⚡ Direct Signal Mode: <b>{'සක්‍රීයයි 🔥 [DIRECT]' if state.get('direct_signal_mode', False) else 'අක්‍රීයයි 🛡️ [FW FILTER]'}</b>\n"
                         f"⏱️ BOT WINDOW STATUS : <b>{window_status}</b>\n"
-                        f"⏰ සිග්නල් දෙන කාලය: <b>දවල් {state.get('start_hour', 8)}:{state.get('start_minute', 0)} සිට රාත්‍රී {state.get('end_hour', 23)}:{state.get('end_minute', 59)} දක්වා.</b>\n"
-                        f"🥇 First Win කාලය: <b>{state.get('fw_start_hour', 0)}:{state.get('fw_start_minute', 0)} සිට {state.get('fw_end_hour', 23)}:{state.get('fw_end_minute', 59)} දක්වා.</b>\n"
+                        f"⏰ සිග්නල් දෙන කාලය: <b>{start_period} {state.get('start_hour', 8)}:{state.get('start_minute', 0)} සිට {end_period} {state.get('end_hour', 23)}:{state.get('end_minute', 59)} දක්වා.</b>\n"
+                        f"🥇 First Win කාලය: <b>{fw_start_period} {state.get('fw_start_hour', 0)}:{state.get('fw_start_minute', 0)} සිට {fw_end_period} {state.get('fw_end_hour', 23)}:{state.get('fw_end_minute', 59)} දක්වා.</b>\n"
                         f"💵 මූලික ට්‍රේඩ් මාජින්: <b>${state.get('base_margin', 0.80)}</b>\n"
                         f"⚙️ Leverage: <b>{state.get('leverage', 10)}x</b>\n"
-                        f"🛡️ SL: <b>{state.get('margin_sl_pct', 27.0)}%</b> | TP: <b>{state.get('fast_tp_pct', 30.0)}%</b>\n"
+                        f"🛡️ SL: <b>{state.get('margin_sl_pct', 27.0)}%</b> \| TP: <b>{state.get('fast_tp_pct', 30.0)}%</b>\n"
                         f"🥇 First Win Coins ගණන: <b>{fw_list_count}</b>\n"
                         f"🚫 Blacklist Coins ගණන: <b>{bl_list_count}</b>"
                     )
@@ -515,16 +564,31 @@ def telegram_webhook():
                 menu_msg = (
                     f"🛠️ <b>RED BULL MASTER CONTROL PANEL</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"👉 /bot_on | /bot_off\n"
-                    f"👉 /reminder_on | /reminder_off\n"
-                    f"👉 /recovery_only_on | /recovery_only_off\n"
-                    f"👉 /scan_now\n"
-                    f"👉 /add_fw COIN | /remove_fw COIN\n"
-                    f"👉 /add_bl COIN | /remove_bl COIN\n"
-                    f"👉 /set_signal_time H:M H:M\n"
-                    f"👉 /set_fw_time H:M H:M\n"
-                    f"👉 /check_health 🔍\n"
-                    f"👉 /view_lists | /clear_lists | /reset_trades"
+                    f"🎛️ <b>බොට් පාලනය (Bot Control):</b>\n"
+                    f"👉 /bot_on — ස්කෑනරය සක්‍රීය කරයි (ON)\n"
+                    f"👉 /bot_off — ස්කෑනරය තාවකාලිකව නවත්වයි (OFF)\n"
+                    f"👉 /scan_now — දැනටමත් සියලුම කාසි ස්කෑන් කරයි\n\n"
+                    f"⚡ <b>විශේෂ පරීක්ෂණ ක්‍රමවේද (Testing Modes):</b>\n"
+                    f"👉 /direct_mode_on — FW ලැයිස්තුව නැතිව කෙලින්ම සිග්නල් දෙයි 🔥\n"
+                    f"👉 /direct_mode_off — සාමාන්‍ය ආරක්ෂිත ක්‍රමය (FW Filter) 🛡️\n"
+                    f"👉 /recovery_only_on — Recovery Trades පමණක් සිදු කරයි\n"
+                    f"👉 /recovery_only_off — සාමාන්‍ය ක්‍රියාකාරීත්වය (Normal Mode)\n\n"
+                    f"🔔 <b>මතක් කිරීම් පද්ධතිය:</b>\n"
+                    f"👉 /reminder_on — විනාඩියෙන් විනාඩියට Reminder සක්‍රීය කරයි\n"
+                    f"👉 /reminder_off — Reminder පණිවිඩ අක්‍රීය කරයි\n\n"
+                    f"⏱️ <b>කාල පරාස සැකසීම:</b>\n"
+                    f"👉 /set_signal_time H:M H:M — සිග්නල් දෙන කාලය සකසයි\n"
+                    f"👉 /set_fw_time H:M H:M — First Win ටෙස්ට් කරන කාලය සකසයි\n\n"
+                    f"📝 <b>කාසි ලැයිස්තු පාලනය:</b>\n"
+                    f"👉 /add_fw COIN | /remove_fw COIN — First Win ලැයිස්තුව\n"
+                    f"👉 /add_bl COIN | /remove_bl COIN — Blacklist ලැයිස්තුව\n"
+                    f"👉 /view_lists — දැනට පවතින කාසි ලැයිස්තු බලන්න\n"
+                    f"👉 /clear_lists — ලැයිස්තු දෙකම සම්පූර්ණයෙන්ම හිස් කරයි\n\n"
+                    f"📊 <b>තත්ත්ව වාර්තා සහ Reset:</b>\n"
+                    f"👉 /status — බොට්ගේ වත්මන් සමස්ත වාර්තාව\n"
+                    f"👉 /check_health — පද්ධති කොටස් වැඩදැයි බලන්න (Health Check)\n"
+                    f"👉 /reset_trades — Active Trades දත්ත ශුන්‍ය (Reset) කරයි\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 )
                 execute_telegram_send(menu_msg)
                 
@@ -545,6 +609,15 @@ def telegram_webhook():
             elif cmd == "bot_off":
                 with state_lock: state['is_scanning'] = False
                 sync_save(); execute_telegram_send("⏸️ <b>බොට් ස්කෑනර් එන්ට්‍රීම ක්‍රියාවිරහිත කරන ලදී (OFF).</b>")
+            
+            # නවීකරණය: Direct Signal Mode සක්‍රීය / අක්‍රීය කිරීමේ Commands
+            elif cmd == "direct_mode_on":
+                with state_lock: state['direct_signal_mode'] = True
+                sync_save(); execute_telegram_send("⚡ <b>Direct Signal Mode සක්‍රීය කරන ලදී (ON)!</b>\nදැන් First Win ලැයිස්තුව නොබලා, ස්කෑන් වන සියලුම කාසි සඳහා සෘජුවම සිග්නල් නිකුත් කරනු ලබයි.")
+            elif cmd == "direct_mode_off":
+                with state_lock: state['direct_signal_mode'] = False
+                sync_save(); execute_telegram_send("🛡️ <b>Direct Signal Mode අක්‍රීය කරන ලදී (OFF).</b>\nබොට් නැවතත් සාමාන්‍ය ආරක්ෂිත පියවර අනුගමනය කරමින් First Win ලැයිස්තුවේ ඇති කාසි පමණක් පෙරහන් (Filter) කර සිග්නල් ලබා දෙයි.")
+                
             elif cmd == "reminder_on":
                 with state_lock: state['reminder_system_active'] = True
                 sync_save(); execute_telegram_send("🔔 <b>විනාඩියෙන් විනාඩිය මතක් කිරීම සක්‍රීය කලා.</b>")
