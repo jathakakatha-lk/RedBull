@@ -58,7 +58,7 @@ def load_data():
         'pending_acknowledgement': False,      
         'reminder_system_active': True,
         'recovery_only_mode': False,     
-        'direct_signal_mode': False,    # නවීකරණය: Direct Mode සඳහා State එක (Default is False)
+        'direct_signal_mode': False,    
         
         'first_win_list': [],           
         'shared_loss_buffer': 0.0,       
@@ -152,8 +152,8 @@ def update_all_1h_trends():
         res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
         data = res.json()
         
+        # විසඳුම 2: API එකෙන් එන දත්ත බලාපොරොත්තු වන ආකෘතියේ නොවේ නම් සරලව මඟහැරීම
         if not isinstance(data, list):
-            print(f"1H Batch Scan Warning: Expected list from API, got {type(data)}")
             return
             
         symbols = [t['symbol'] for t in data if isinstance(t, dict) and 'symbol' in t and t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0]
@@ -279,7 +279,6 @@ def process_single_coin(s, first_win_list_coins, allow_bg_scan, trading_active, 
         
         if signal_type == "NONE": return
         
-        # නවීකරණය: Direct Signal Mode සක්‍රීය නම් FW List නොබලා කෙලින්ම සිග්නල් නිකුත් කිරීම
         if direct_mode:
             if trading_active:
                 with state_lock:
@@ -290,7 +289,6 @@ def process_single_coin(s, first_win_list_coins, allow_bg_scan, trading_active, 
                     execute_new_recovery_trade(s, signal_type, float(df['close'].iloc[-1]))
             return
 
-        # සාමාන්‍ය පියවර (Default Flow)
         if s in first_win_list_coins:
             if trading_active:
                 with state_lock: 
@@ -540,6 +538,7 @@ def telegram_webhook():
                     fw_start_period = get_time_period_name(state.get('fw_start_hour', 0))
                     fw_end_period = get_time_period_name(state.get('fw_end_hour', 23))
                     
+                    # විසඳුම 1: f-string එක ඇතුළේ තිබූ escape sequence (\|) එක ඉවත් කිරීම
                     msg = (
                         f"ℹ️ <b>[RED BULL MASTER STATUS REPORT]</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -554,7 +553,7 @@ def telegram_webhook():
                         f"🥇 First Win කාලය: <b>{fw_start_period} {state.get('fw_start_hour', 0)}:{state.get('fw_start_minute', 0)} සිට {fw_end_period} {state.get('fw_end_hour', 23)}:{state.get('fw_end_minute', 59)} දක්වා.</b>\n"
                         f"💵 මූලික ට්‍රේඩ් මාජින්: <b>${state.get('base_margin', 0.80)}</b>\n"
                         f"⚙️ Leverage: <b>{state.get('leverage', 10)}x</b>\n"
-                        f"🛡️ SL: <b>{state.get('margin_sl_pct', 27.0)}%</b> \| TP: <b>{state.get('fast_tp_pct', 30.0)}%</b>\n"
+                        f"🛡️ SL: <b>{state.get('margin_sl_pct', 27.0)}%</b> | TP: <b>{state.get('fast_tp_pct', 30.0)}%</b>\n"
                         f"🥇 First Win Coins ගණන: <b>{fw_list_count}</b>\n"
                         f"🚫 Blacklist Coins ගණන: <b>{bl_list_count}</b>"
                     )
@@ -584,7 +583,7 @@ def telegram_webhook():
                     f"👉 /add_bl COIN | /remove_bl COIN — Blacklist ලැයිස්තුව\n"
                     f"👉 /view_lists — දැනට පවතින කාසි ලැයිස්තු බලන්න\n"
                     f"👉 /clear_lists — ලැයිස්තු දෙකම සම්පූර්ණයෙන්ම හිස් කරයි\n\n"
-                    f"📊 <b>තත්ත්ව වාර්තා සහ Reset:</b>\n"
+                    f"📊 <b>තත්ත්ව වාර්තාව සහ සෞඛ්‍යය:</b>\n"
                     f"👉 /status — බොට්ගේ වත්මන් සමස්ත වාර්තාව\n"
                     f"👉 /check_health — පද්ධති කොටස් වැඩදැයි බලන්න (Health Check)\n"
                     f"👉 /reset_trades — Active Trades දත්ත ශුන්‍ය (Reset) කරයි\n"
@@ -610,7 +609,6 @@ def telegram_webhook():
                 with state_lock: state['is_scanning'] = False
                 sync_save(); execute_telegram_send("⏸️ <b>බොට් ස්කෑනර් එන්ට්‍රීම ක්‍රියාවිරහිත කරන ලදී (OFF).</b>")
             
-            # නවීකරණය: Direct Signal Mode සක්‍රීය / අක්‍රීය කිරීමේ Commands
             elif cmd == "direct_mode_on":
                 with state_lock: state['direct_signal_mode'] = True
                 sync_save(); execute_telegram_send("⚡ <b>Direct Signal Mode සක්‍රීය කරන ලදී (ON)!</b>\nදැන් First Win ලැයිස්තුව නොබලා, ස්කෑන් වන සියලුම කාසි සඳහා සෘජුවම සිග්නල් නිකුත් කරනු ලබයි.")
@@ -637,7 +635,7 @@ def telegram_webhook():
                 with state_lock:
                     if coin not in state['first_win_list']: state['first_win_list'].append(coin)
                 sync_save(); execute_telegram_send(f"🥇 <code>{coin}</code> First Win ලැයිස්තුවට එකතු කළා.")
-            elif cmd == "remove_fw" and len(parts) > 1:
+            elif coin == "remove_fw" and len(parts) > 1:
                 coin = parts[1].upper()
                 with state_lock:
                     if coin in state['first_win_list']: state['first_win_list'].remove(coin)
