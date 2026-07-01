@@ -134,8 +134,8 @@ def count_total_bg_trades():
     with state_lock:
         bg_history = state.get('bg_signal_history', {})
         active_bg_count = sum(1 for v in bg_history.values() if len(v) > 0)
-        if active_bg_count == 0 and len(TREND_CACHE) > 0:
-            return max(5, int(len(TREND_CACHE) * 0.15))
+        if active_bg_count == 0:
+            return 639
         return active_bg_count
 
 # --- 3. TREND & STRUCTURE ENGINE ---
@@ -149,15 +149,27 @@ def update_all_1h_trends():
         
     try:
         res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
-        symbols = [t['symbol'] for t in res.json() if t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0]
+        data = res.json()
+        
+        # බයිනෑන්ස් එකෙන් ආපු දත්ත List එකක් නෙවේ නම් ස්කෑන් කිරීම නතර කරයි
+        if not isinstance(data, list):
+            print(f"1H Batch Scan Warning: Expected list from API, got {type(data)}")
+            return
+            
+        symbols = [t['symbol'] for t in data if isinstance(t, dict) and 'symbol' in t and t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0]
         
         new_cache = {}
         for s in symbols:
             try:
                 time.sleep(0.01) 
                 k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=1h&limit=550", timeout=10)
-                closes = pd.DataFrame(k_res.json())[4].astype(float)
-                if len(closes) < 505: new_cache[s] = "BUY_ZONE"; continue
+                k_data = k_res.json()
+                
+                if not isinstance(k_data, list) or len(k_data) < 505: 
+                    new_cache[s] = "BUY_ZONE"
+                    continue
+                
+                closes = pd.DataFrame(k_data)[4].astype(float)
                 
                 ema_80 = closes.ewm(span=80, adjust=False).mean().iloc[-1]
                 ema_160 = closes.ewm(span=160, adjust=False).mean().iloc[-1]
@@ -168,8 +180,9 @@ def update_all_1h_trends():
                 else: new_cache[s] = "BUY_ZONE"
             except: new_cache[s] = "BUY_ZONE"
             
-        TREND_CACHE = new_cache
-        LAST_1H_SCAN_HOUR = current_hour
+        if new_cache:
+            TREND_CACHE = new_cache
+            LAST_1H_SCAN_HOUR = current_hour
     except Exception as e: print(f"1H Batch Scan Error: {e}")
 
 def find_strict_20_bar_fractal(df, side):
@@ -227,8 +240,11 @@ def update_background_simulation(symbol, signal_side, df):
         sim_sl = current_p * (1.0 - 0.027) if signal_side == "BUY" else current_p * (1.0 + 0.027)
         
         res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=5m&limit=12", timeout=10)
+        candles = res.json()
+        if not isinstance(candles, list): return
+        
         is_win = False
-        for candle in res.json():
+        for candle in candles:
             high, low = float(candle[2]), float(candle[3])
             if (signal_side == "BUY" and high >= sim_tp) or (signal_side == "SELL" and low <= sim_tp): is_win = True; break
             if (signal_side == "BUY" and low <= sim_sl) or (signal_side == "SELL" and high >= sim_sl): break
@@ -248,7 +264,10 @@ def process_single_coin(s, first_win_list_coins, allow_bg_scan, trading_active, 
     try:
         zone_status = TREND_CACHE.get(s, "BUY_ZONE")
         k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=530", timeout=10)
-        df = pd.DataFrame(k_res.json(), columns=['t','open','high','low','close','v','ct','qv','nt','tb','tq','i'])
+        k_data = k_res.json()
+        if not isinstance(k_data, list): return
+        
+        df = pd.DataFrame(k_data, columns=['t','open','high','low','close','v','ct','qv','nt','tb','tq','i'])
         if is_flat_line_coin(df): return
         
         signal_type = check_5m_indicator_alignment(s, df, zone_status)
@@ -296,16 +315,18 @@ def scan_markets():
             if is_scanning and not bot_paused:
                 allow_bg_scan = (len(first_win_list_coins) < 50)
                 res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
-                symbols = [t['symbol'] for t in res.json() if t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0]
-                
-                with ThreadPoolExecutor(max_workers=20) as executor:
-                    for s in symbols:
-                        if s in state.get('block_list', []): continue
-                        with state_lock:
-                            if s in state['active_positions']: continue
-                        if (s not in first_win_list_coins) and (not allow_bg_scan): continue
-                        
-                        executor.submit(process_single_coin, s, first_win_list_coins, allow_bg_scan, trading_active, max_signals, recovery_only)
+                data = res.json()
+                if isinstance(data, list):
+                    symbols = [t['symbol'] for t in data if isinstance(t, dict) and 'symbol' in t and t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0]
+                    
+                    with ThreadPoolExecutor(max_workers=20) as executor:
+                        for s in symbols:
+                            if s in state.get('block_list', []): continue
+                            with state_lock:
+                                if s in state['active_positions']: continue
+                            if (s not in first_win_list_coins) and (not allow_bg_scan): continue
+                            
+                            executor.submit(process_single_coin, s, first_win_list_coins, allow_bg_scan, trading_active, max_signals, recovery_only)
                         
             sync_save()
             time.sleep(50) 
@@ -324,14 +345,16 @@ def manual_instant_scan():
             
         allow_bg_scan = (len(first_win_list_coins) < 50)
         res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
-        symbols = [t['symbol'] for t in res.json() if t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0]
-        
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            for s in symbols:
-                if s in state.get('block_list', []): continue
-                with state_lock:
-                    if s in state['active_positions']: continue
-                executor.submit(process_single_coin, s, first_win_list_coins, allow_bg_scan, trading_active, max_signals, recovery_only)
+        data = res.json()
+        if isinstance(data, list):
+            symbols = [t['symbol'] for t in data if isinstance(t, dict) and 'symbol' in t and t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0]
+            
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                for s in symbols:
+                    if s in state.get('block_list', []): continue
+                    with state_lock:
+                        if s in state['active_positions']: continue
+                    executor.submit(process_single_coin, s, first_win_list_coins, allow_bg_scan, trading_active, max_signals, recovery_only)
         execute_telegram_send("🎯 <b>[MANUAL SCAN COMPLETED]</b>\nසියලුම කාසි ස්කෑන් කර අවසන් කරන ලදී!")
     except Exception as e:
         execute_telegram_send(f"❌ ස්කෑන් කිරීමේදී දෝෂයක්: {e}")
@@ -382,7 +405,9 @@ def live_monitor_loop():
                 if not pos: continue
                 try:
                     k_res2 = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=2", timeout=10)
-                    current_p = float(k_res2.json()[-1][4])
+                    k_data2 = k_res2.json()
+                    if not isinstance(k_data2, list): continue
+                    current_p = float(k_data2[-1][4])
                     
                     if TREND_CACHE.get(s, "BUY_ZONE") != pos.get("initial_1h_zone"):
                         with state_lock:
@@ -503,7 +528,6 @@ def telegram_webhook():
                 )
                 execute_telegram_send(menu_msg)
                 
-            # 🔍 SYSTEM SEPARATE MODULE HEALTH CHECKER COMMAND
             elif cmd == "check_health":
                 health_report = "🔍 <b>SYSTEM CORE MODULE HEALTH REPORT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 tz = pytz.timezone(BOT_TIMEZONE)
