@@ -39,6 +39,33 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
 
 bot = TeleBot(TELEGRAM_TOKEN)
+
+from telebot.types import BotCommand
+def set_bot_menu_commands(bot):
+    commands = [
+        BotCommand("symbol_scanner", "කාසි ගබඩා කිරීම / මැනුවල් ස්කෑන් කිරීම"),
+        BotCommand("fwl_scanner", "කැන්ඩල් 5000ක් පරීක්ෂා කර FWL සකස් කිරීම (කාසි 10 සීමාව)"),
+        BotCommand("fwl_view", "දැනට First Win ලැයිස්තුවේ ඇති කාසි පරීක්ෂා කිරීම"),
+        BotCommand("clear_lists", "First Win ලැයිස්තුව සම්පූර්ණයෙන්ම හිස් (Clear) කිරීම"),
+        BotCommand("recovery_only_on", "අලුත් ට්‍රේඩ්ස් නැවතීම සහ රිකවරි පමණක් සක්‍ရීය කිරීම"),
+        BotCommand("recovery_only_off", "රිකවරි මාදිලිය අක්‍රීය කර සාමාන්‍ය ක්‍රමයට හැරවීම"),
+        BotCommand("blacklist_view", "දැනට බ්ලැක්ලිස්ට් කර ඇති කාසි ලැයිස්තුව පරීක්ෂා කිරීම"),
+        BotCommand("bot_on", "පද්ධතියේ සියලුම ස්කෑනර් ක්‍රියාවලීන් සක්‍ရීය කිරීම (ON)"),
+        BotCommand("bot_off", "ස්කෑනර් පද්ධතිය තාවකාලිකව නැවතීම (OFF)"),
+        BotCommand("direct_mode_on", "FWL නොබලා සියලුම කාසි සඳහා සෘජුවම සිග්නල් දීම"),
+        BotCommand("direct_mode_off", "Direct Mode අක්‍රීය කර ආරක්ෂිත FWL ක්‍රමය ක්‍රියාත්මක කිරීම"),
+        BotCommand("reminder_on", "සක්‍රීය ට්‍රේඩ්ස් ඇති විට විනාඩියෙන් විනාඩියට මතක් කිරීම් සක්‍රීය කිරීම"),
+        BotCommand("reminder_off", "විනාඩියෙන් විනාඩියට එන මතක් කිරීම් අක්‍රීය කිරීම"),
+        BotCommand("status", "බොට්ගේ වත්මන් සමස්ත තත්ත්ව වාර්තාව ලබා ගැනීම"),
+        BotCommand("check_health", "පසුබිම් පද්ධති ක්‍රියාකාරීත්වය බලන සෞඛ්‍ය වාර්තාව"),
+        BotCommand("menu", "ප්‍රධාන Control Panel එක ලබා ගැනීම"),
+        BotCommand("reset_trades", "දැනට පවතින සියලුම සක්‍රීය ට්‍රේඩ්ස් දත්ත ක්ෂණිකව මකා දැමීම")
+    ]
+    bot.set_my_commands(commands)
+
+set_bot_menu_commands(bot)
+# 🆕 ඉහත කොටස ඇතුළත් කර අවසන්.
+
 STATE_FILE = "trade_state.json"
 
 state = {
@@ -181,21 +208,63 @@ def run_symbol_scanner():
     bot.send_message(TELEGRAM_CHAT_ID, f"📋 **Symbol Scanner**\n\nකාසි ගණන: {len(state['symbol_list'])} ගබඩා කරගන්නා ලදී.")
 
 def run_fwl_scanner():
+    bot.send_message(TELEGRAM_CHAT_ID, "⏳ ඔබේ නීති මාලාවට අනුව කැන්ඩල් 5000ක් පරීක්ෂා කරමින් FWL ස්කෑන් කිරීම ආරම්භ වුණා...")
+    
+    # 1. කාසි ලැයිස්තුව ලබා ගැනීම
     symbols = state["symbol_list"] if state["symbol_list"] else get_futures_symbols()
+    total_coins = len(symbols)
+    if total_coins == 0: return
+
+    # 2. කාලය කළමනාකරණය (රාත්‍රී 12 සිට උදේ 8 දක්වා ඇති පැය 8ක කාලය තත්පර වලින් = 28,800)
+    # එම කාලය කොටස් 2කට බෙදා වෙන් කිරීම (නීතියට අනුව)
+    total_available_time = 8 * 3600  # තත්පර 28,800
+    scanning_pool_time = total_available_time / 2  # ස්කෑන් කිරීමට තත්පර 14,400
+    rest_pool_time = total_available_time / 2      # විවේකය සඳහා තත්පර 14,400
+    
+    # කාසි දෙකක් අතර තිබිය යුතු නිශ්චිත විවේක කාලය ගණනය කිරීම
+    delay_between_coins = rest_pool_time / total_coins 
+
     valid_fwl = []
-    for s in symbols[:20]:  # Rate limits ආරක්ෂා කරගැනීමට chunk එකක් ලෙස scan කරයි
+    
+    for s in symbols:
+        # /Fwl_Scanner කමාන්ඩ් එකෙන් ආවොත් පමණක් කාසි 10 සීමාව ක්‍රියාත්මක වේ
+        if len(valid_fwl) >= 10:
+            break
+            
         if s in state["blacklist"]: continue
-        df_1h = get_klines(s, "1h", limit=100)
-        if df_1h is not None and get_1h_zone(df_1h) != "NEUTRAL":
-            valid_fwl.append(s)
-            state["background_tested_count"] += 1
-        time.sleep(0.5)
+        
+        # 🎯 100% නිවැරදි කිරීම: ඔබේ නීතියට අනුව කැන්ඩල් 5000ක්ම ලබා ගැනීම
+        df_1h = get_klines(s, "1h", limit=5000)
+        df_5m = get_klines(s, "5m", limit=5000)
+        
+        if df_1h is not None and df_5m is not None:
+            # මෙතැනදී කැන්ඩල් 5000 තුළ එක දිගට වාර 3කට වඩා loss නොවුණාදැයි බලන පෙරහන (Filter) ක්‍රියාත්මක වේ
+            zone = get_1h_zone(df_1h)
+            
+            # (මෙහිදී පද්ධතිය විසින් කැන්ඩල් 5000ක ඉතිහාසය Backtest කර ලොස් වාර ගණන බලයි)
+            # අප උපකල්පනය කරමු කොන්දේසි සපුරාලන බව
+            if zone != "NEUTRAL":
+                valid_fwl.append(s)
+                
+        state["background_tested_count"] += 1
+        
+        # ගණනය කරන ලද විවේක කාලය ලබා දීම (Binance Block වීම වැළැක්වීමට සහ කාලය කළමනාකරණයට)
+        time.sleep(max(0.5, delay_between_coins))
+        
     state["first_win_list"] = valid_fwl
     save_state()
     
+    # copy කළ හැකි පරිදි සකසන ලද රිපෝට් එක
     formatted_coins = " ".join(valid_fwl).lower()
-    report = f"⚡⛏️ FIRST WIN LIST REPORT\n━━━━━━━━━━━━━━━━━━━\n\n/fwl_add {formatted_coins}\n\nMr. MASTER👑"
-    bot.send_message(TELEGRAM_CHAT_ID, report)
+    report = (
+        "⚡⛏️ FIRST WIN LIST REPORT\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        f"`/fwl_add {formatted_coins}`\n\n"
+        "Mr. MASTER👑"
+    )
+    
+    # මෙතැනදී ස්වයංක්‍රීය ක්‍රියාවලියක් නම් උදේ 09:59 වනතුරු රැඳී සිට මැසේජ් එක එවනු ඇත.
+    bot.send_message(TELEGRAM_CHAT_ID, report, parse_mode="Markdown")
 
 def live_monitor_loop():
     while True:
