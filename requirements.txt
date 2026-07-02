@@ -1,8 +1,6 @@
-python-binance
+pyTelegramBotAPI
 pandas
 numpy
 requests
 flask
-statsmodels
-scipy
 gunicorn
