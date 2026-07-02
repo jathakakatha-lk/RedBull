@@ -390,6 +390,14 @@ def cron_scheduler_loop():
 if __name__ == "__main__":
     load_state()
     
+    # ⚠️ පරණ Webhook එකක් සක්‍රීයව ඇත්නම් එය සම්පූර්ණයෙන්ම ඉවත් කරයි (Conflict එක විසඳීමට)
+    try:
+        logging.info("Removing any active webhooks to prevent 409 conflict...")
+        bot.remove_webhook()
+        time.sleep(1) # සර්වර් එකට සිතීමට සුළු විවේකයක්
+    except Exception as e:
+        logging.error(f"Error removing webhook: {e}")
+    
     # 1. Flask alive server එක වෙනම Thread එකක run කරනවා (Railway Healthcheck සඳහා)
     threading.Thread(target=run_flask, daemon=True).start()
     
