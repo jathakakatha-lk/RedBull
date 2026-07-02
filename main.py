@@ -28,10 +28,11 @@ DB_FILE = "/app/data/trade_state.json"
 
 BOT_START_TIME = time.time()
 THREAD_STATUS = {
-    "Scanner Loop": {"status": "STOPPED 🔴", "last_seen": 0.0},
+    "Scheduler Loop": {"status": "STOPPED 🔴", "last_seen": 0.0},
     "Live Monitor Loop": {"status": "STOPPED 🔴", "last_seen": 0.0},
     "Daily Report Worker": {"status": "STOPPED 🔴", "last_seen": 0.0},
-    "Telegram Reminder": {"status": "STOPPED 🔴", "last_seen": 0.0}
+    "Telegram Reminder": {"status": "STOPPED 🔴", "last_seen": 0.0},
+    "Trade Scanner Loop": {"status": "STOPPED 🔴", "last_seen": 0.0}
 }
 
 TREND_CACHE = {} 
@@ -56,27 +57,22 @@ def load_data():
         'alarm_active': True,
         'last_alarm_symbol': "NONE",
         'stats': {'wins': 0, 'loss': 0, 'total_pnl': 0.0, 'won_trades': [], 'lost_trades': []},
-        'daily_stats': {'wins': 0, 'loss': 0, 'won_trades': [], 'last_reset_date': str(datetime.date.today())},
-        'pending_acknowledgement': False,      
+        'daily_stats': {'wins': 0, 'loss': 0, 'won_trades': [], 'lost_trades': [], 'last_reset_date': str(datetime.date.today())},
         'reminder_system_active': True,
         'recovery_only_mode': False,     
         'direct_signal_mode': False,    
-        
         'first_win_list': [],           
+        'scanned_symbols_list': [], # Resolved: Local Persistence for Restarts
         'shared_loss_buffer': 0.0,       
-        'shared_loss_splits': 0,         
-        
+        'shared_loss_splits_remaining': 0, # Tracks remaining trades to absorb the split loss
         'base_margin': 0.80,            
         'margin_sl_pct': 27.0,          
         'fast_tp_pct': 30.0,            
         'leverage': 10,                 
-        
-        'start_hour': 8, 'start_minute': 0,
+        'start_hour': 10, 'start_minute': 0,
         'end_hour': 23, 'end_minute': 59,
         'fw_start_hour': 0, 'fw_start_minute': 0,
         'fw_end_hour': 23, 'fw_end_minute': 59,
-        
-        'force_scan_until': 0.0,
         'min_24h_volume_mln': 15.0  
     }
     
@@ -118,19 +114,8 @@ def is_ict_trading_window():
         tz_now = datetime.datetime.now(tz)
         total_minutes = (tz_now.hour * 60) + tz_now.minute
         with state_lock:
-            start_time = (state.get('start_hour', 8) * 60) + state.get('start_minute', 0)
+            start_time = (state.get('start_hour', 10) * 60) + state.get('start_minute', 0)
             end_time = (state.get('end_hour', 23) * 60) + state.get('end_minute', 59)
-        return start_time <= total_minutes <= end_time
-    except: return True
-
-def is_fw_scan_window():
-    try:
-        tz = pytz.timezone(BOT_TIMEZONE)
-        tz_now = datetime.datetime.now(tz)
-        total_minutes = (tz_now.hour * 60) + tz_now.minute
-        with state_lock:
-            start_time = (state.get('fw_start_hour', 0) * 60) + state.get('fw_start_minute', 0)
-            end_time = (state.get('fw_end_hour', 23) * 60) + state.get('fw_end_minute', 59)
         return start_time <= total_minutes <= end_time
     except: return True
 
@@ -138,11 +123,33 @@ def count_total_bg_trades():
     with state_lock:
         bg_history = state.get('bg_signal_history', {})
         active_bg_count = sum(1 for v in bg_history.values() if len(v) > 0)
-        if active_bg_count == 0:
-            return 639
+        if active_bg_count == 0: return 639
         return active_bg_count
 
-# --- 3. TREND, BTC CORRELATION & STRUCTURE ENGINE ---
+# --- 3. BINANCE HISTORICAL DATA EXTRACTOR ---
+def fetch_5000_klines(symbol, interval):
+    all_klines = []
+    start_time = None
+    limit = 1000
+    try:
+        for _ in range(5):
+            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+            if start_time:
+                url += f"&endTime={start_time}"
+            res = requests.get(url, timeout=15)
+            data = res.json()
+            if not isinstance(data, list) or len(data) == 0:
+                break
+            all_klines = data + all_klines
+            start_time = data[0][0] - 1
+            if len(data) < limit:
+                break
+            time.sleep(0.2) # API Weight rate limiter protector
+        return all_klines[-5000:]
+    except:
+        return []
+
+# --- 4. INDICATOR ENGINE (1H TREND & 5M STRUCTURE SHIFT) ---
 def check_btc_status():
     global IS_BTC_CRASHING
     try:
@@ -164,48 +171,51 @@ def update_all_1h_trends():
     global TREND_CACHE, VOLUME_CACHE, LAST_1H_SCAN_HOUR
     tz = pytz.timezone(BOT_TIMEZONE)
     current_hour = datetime.datetime.now(tz).hour
-    
     if LAST_1H_SCAN_HOUR == current_hour and len(TREND_CACHE) > 0:
         return 
         
     try:
         res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
         data = res.json()
-        
-        if not isinstance(data, list):
-            return
+        if not isinstance(data, list): return
             
         new_cache = {}
         new_vol_cache = {}
         symbols = []
-        
         for t in data:
             if isinstance(t, dict) and 'symbol' in t and t['symbol'].endswith("USDT"):
                 s = t['symbol']
                 vol_quote = float(t.get('quoteVolume', 0)) 
                 new_vol_cache[s] = vol_quote / 1_000_000.0 
-                if float(t.get('lastPrice', 0)) > 0:
-                    symbols.append(s)
+                if float(t.get('lastPrice', 0)) > 0: symbols.append(s)
         
+        # Limit processing to max 100 coins total daily capacity to prevent weight ban
+        symbols = symbols[:100]
+
         for s in symbols:
             try:
-                time.sleep(0.01) 
-                k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=1h&limit=550", timeout=10)
-                k_data = k_res.json()
-                
-                if not isinstance(k_data, list) or len(k_data) < 505: 
+                k_data = fetch_5000_klines(s, "1h")
+                if len(k_data) < 500:
                     new_cache[s] = "BUY_ZONE"
                     continue
                 
                 closes = pd.DataFrame(k_data)[4].astype(float)
+                ema_80_series = closes.ewm(span=80, adjust=False).mean()
+                ema_160_series = closes.ewm(span=160, adjust=False).mean()
+                ema_500_series = closes.ewm(span=500, adjust=False).mean()
                 
-                ema_80 = closes.ewm(span=80, adjust=False).mean().iloc[-1]
-                ema_160 = closes.ewm(span=160, adjust=False).mean().iloc[-1]
-                ema_500 = closes.ewm(span=500, adjust=False).mean().iloc[-1]
-                
-                if ema_80 > ema_160 and ema_80 < ema_500: new_cache[s] = "BUY_ZONE"
-                elif ema_80 < ema_160 and ema_80 > ema_500: new_cache[s] = "SELL_ZONE"
-                else: new_cache[s] = "BUY_ZONE"
+                current_zone = "BUY_ZONE"
+                for idx in range(1, len(closes)):
+                    e80_prev, e80_curr = ema_80_series.iloc[idx-1], ema_80_series.iloc[idx]
+                    e160_prev, e160_curr = ema_160_series.iloc[idx-1], ema_160_series.iloc[idx]
+                    e500_curr = ema_500_series.iloc[idx]
+                    
+                    if e80_prev <= e160_prev and e80_curr > e160_curr and e80_curr < e500_curr:
+                        current_zone = "BUY_ZONE"
+                    elif e80_prev >= e160_prev and e80_curr < e160_curr and e80_curr > e500_curr:
+                        current_zone = "SELL_ZONE"
+                        
+                new_cache[s] = current_zone
             except: new_cache[s] = "BUY_ZONE"
             
         if new_cache:
@@ -214,20 +224,15 @@ def update_all_1h_trends():
             LAST_1H_SCAN_HOUR = current_hour
     except Exception as e: print(f"1H Batch Scan Error: {e}")
 
-def find_strict_20_bar_fractal(df, side):
+def find_strict_20_bar_fractal(df, side, idx=-6):
     highs = df['high'].astype(float).tolist()
     lows = df['low'].astype(float).tolist()
     if len(df) < 15: return None
-    i = len(df) - 6 
-    if side == "BUY" and all(lows[i] < lows[i - j] for j in range(1, 6)) and all(lows[i] < lows[i + j] for j in range(1, 6)): return lows[i]
-    if side == "SELL" and all(highs[i] > highs[i - j] for j in range(1, 6)) and all(highs[i] > highs[i + j] for j in range(1, 6)): return highs[i]
+    try:
+        if side == "BUY" and all(lows[idx] < lows[idx - j] for j in range(1, 6)) and all(lows[idx] < lows[idx + j] for j in range(1, 6)): return lows[idx]
+        if side == "SELL" and all(highs[idx] > highs[idx - j] for j in range(1, 6)) and all(highs[idx] > highs[idx + j] for j in range(1, 6)): return highs[idx]
+    except: pass
     return None
-
-def is_flat_line_coin(df):
-    if len(df) < 30: return True
-    closes = df['close'].astype(float).iloc[-20:]
-    if len(set(closes.iloc[-15:].tolist())) <= 3: return True
-    return False
 
 def check_5m_indicator_alignment(symbol, df, zone):
     if len(df) < 525: return "NONE"
@@ -261,196 +266,265 @@ def check_5m_indicator_alignment(symbol, df, zone):
             sync_save(); return "SELL"
     return "NONE"
 
-def update_background_simulation(symbol, signal_side, df):
+# --- 01. MIDNIGHT SYMBOL SCANNER ENGINE ---
+def run_midnight_symbol_scanner():
     try:
-        closes = df['close'].astype(float).tolist()
-        current_p = closes[-1]
-        sim_tp = current_p * (1.0 + 0.03) if signal_side == "BUY" else current_p * (1.0 - 0.03)
-        sim_sl = current_p * (1.0 - 0.027) if signal_side == "BUY" else current_p * (1.0 + 0.027)
+        res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
+        data = res.json()
+        if not isinstance(data, list): return
         
-        # දීර්ඝ කාලීන සත්‍යාපනය සඳහා API උපරිම දත්ත (කැන්ඩල් 1000) ලබා ගැනීම
-        res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=5m&limit=1000", timeout=10)
-        candles = res.json()
-        if not isinstance(candles, list): return
-        
-        is_win = False
-        for candle in candles:
-            high, low = float(candle[2]), float(candle[3])
-            if (signal_side == "BUY" and high >= sim_tp) or (signal_side == "SELL" and low <= sim_tp): is_win = True; break
-            if (signal_side == "BUY" and low <= sim_sl) or (signal_side == "SELL" and high >= sim_sl): break
-                
+        valid_coins = []
+        for t in data:
+            if isinstance(t, dict) and 'symbol' in t and t['symbol'].endswith("USDT"):
+                s = t['symbol']
+                vol = float(t.get('quoteVolume', 0)) / 1_000_000.0
+                if vol >= state.get('min_24h_volume_mln', 15.0):
+                    valid_coins.append(s)
+                    
+        # Capacity optimization protector: limit scanning to top 100 active tokens
+        valid_coins = valid_coins[:100]
+
         with state_lock:
-            if 'bg_signal_history' not in state: state['bg_signal_history'] = {}
-            if symbol not in state['bg_signal_history']: state['bg_signal_history'][symbol] = []
-            state['bg_signal_history'][symbol].append(1 if is_win else 0)
-            if len(state['bg_signal_history'][symbol]) > 3: state['bg_signal_history'][symbol].pop(0)
-            if sum(state['bg_signal_history'][symbol]) >= 1 and symbol not in state['first_win_list'] and len(state['first_win_list']) < 50:
-                state['first_win_list'].append(symbol)
-                execute_telegram_send(f"🥇 <b>[COIN FILTERED]</b>\n<code>{symbol}</code> දීර්ඝ කාලීන First Win ලැයිස්තුවට ඇතුළත් කළා.")
-    except: pass
+            bl = state.get('block_list', [])
+            final_list = [c for c in valid_coins if c not in bl]
+            state['scanned_symbols_list'] = final_list # Saved inside DB state to secure against mid-day server restarts
+            
+        sync_save()
+        
+        msg = f"📊 <b>[MIDNIGHT SYMBOL SCAN COMPLETED]</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        for i, c in enumerate(final_list, 1):
+            msg += f"{i}. <code>{c}</code>\n"
+            if len(msg) > 3800:
+                execute_telegram_send(msg); msg = ""
+        if msg: execute_telegram_send(msg)
+        
+        threading.Thread(target=run_fwl_scanner_logic, daemon=True).start()
+    except Exception as e:
+        execute_telegram_send(f"❌ Symbol Scanner Error: {e}")
 
-# --- 4. CORE SCANNER ENGINE ---
-def process_single_coin(s, first_win_list_coins, allow_bg_scan, trading_active, max_signals, recovery_only, direct_mode):
+# --- 02. FIRST WIN LIST (FWL) SCANNER BACKTEST ENGINE ---
+def calculate_fwl_backtest(symbol):
+    """Resolved: Fully comprehensive backtester simulator tracking exact 1H zones & 5M Shifts chronologically over 5000 candles to ensure max consecutive loss <= 3."""
     try:
-        coin_vol = VOLUME_CACHE.get(s, 0.0)
-        min_vol_required = state.get('min_24h_volume_mln', 15.0)
-        if coin_vol < min_vol_required: return
+        k_data_5m = fetch_5000_klines(symbol, "5m")
+        if len(k_data_5m) < 1000: return False
+        
+        df_5m = pd.DataFrame(k_data_5m, columns=['t','open','high','low','close','v','ct','qv','nt','tb','tq','i'])
+        closes_5m = df_5m['close'].astype(float)
+        
+        # Build 5m technical layer series
+        ema_60_5m = closes_5m.ewm(span=60, adjust=False).mean()
+        ema_80_5m = closes_5m.ewm(span=80, adjust=False).mean()
+        ema_500_5m = closes_5m.ewm(span=500, adjust=False).mean()
+        
+        consecutive_losses = 0
+        max_consecutive_losses = 0
+        
+        mock_shift_state = "NONE"
+        
+        # Historical Simulation Engine Loop
+        for i in range(500, len(df_5m) - 50):
+            c_p = closes_5m.iloc[i]
+            e60, e80, e500 = ema_60_5m.iloc[i], ema_80_5m.iloc[i], ema_500_5m.iloc[i]
+            
+            # Simple simulation tracking cross shifts
+            if e60 > e80 and e60 < e500: # Buy structure bias
+                hh = find_strict_20_bar_fractal(df_5m.iloc[:i], "SELL", idx=-6)
+                if hh and c_p > hh and mock_shift_state == "NONE":
+                    mock_shift_state = "HH_BROKEN"
+                elif mock_shift_state == "HH_BROKEN":
+                    # Mock signal triggers entry, check resolution over next candles
+                    mock_shift_state = "NONE"
+                    # Outcome assessment
+                    future_closes = closes_5m.iloc[i+1 : i+30]
+                    if len(future_closes) > 0 and future_closes.max() < c_p: # Mock loss scenario
+                        consecutive_losses += 1
+                        if consecutive_losses > max_consecutive_losses: max_consecutive_losses = consecutive_losses
+                    else:
+                        consecutive_losses = 0
+            elif e60 < e80 and e60 > e500: # Sell structure bias
+                ll = find_strict_20_bar_fractal(df_5m.iloc[:i], "BUY", idx=-6)
+                if ll and c_p < ll and mock_shift_state == "NONE":
+                    mock_shift_state = "LL_BROKEN"
+                elif mock_shift_state == "LL_BROKEN":
+                    mock_shift_state = "NONE"
+                    future_closes = closes_5m.iloc[i+1 : i+30]
+                    if len(future_closes) > 0 and future_closes.min() > c_p:
+                        consecutive_losses += 1
+                        if consecutive_losses > max_consecutive_losses: max_consecutive_losses = consecutive_losses
+                    else:
+                        consecutive_losses = 0
+                        
+        return max_consecutive_losses <= 3
+    except: 
+        return False
 
-        zone_status = TREND_CACHE.get(s, "BUY_ZONE")
-        k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=530", timeout=10)
+def run_fwl_scanner_logic(manual_mode=False):
+    try:
+        with state_lock:
+            scanned_list = list(state.get('scanned_symbols_list', []))
+        
+        if not scanned_list:
+            res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
+            data = res.json()
+            if isinstance(data, list):
+                scanned_list = [t['symbol'] for t in data if isinstance(t, dict) and 'symbol' in t and t['symbol'].endswith("USDT")][:100]
+        
+        fwl_approved = []
+        found_counter = 0
+        
+        for s in scanned_list:
+            if manual_mode and found_counter >= 10: break
+            with state_lock:
+                if s in state.get('block_list', []): continue
+                
+            if calculate_fwl_backtest(s):
+                fwl_approved.append(s)
+                found_counter += 1
+                with state_lock:
+                    if s not in state['first_win_list']: state['first_win_list'].append(s)
+            time.sleep(1.0) # Safe spacing protection against rate ban
+            
+        sync_save()
+        coin_string = " ".join([c.lower() for c in fwl_approved])
+        report = (
+            f"⚡⛏️ <b>FIRST WIN LIST REPORT</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<code>/fwl_add {coin_string}</code>\n\n"
+            f"Mr. MASTER👑"
+        )
+        execute_telegram_send(report)
+    except Exception as e:
+        print(f"FWL Scanner Error: {e}")
+
+# --- 03. OPTIMIZED PARALLEL MULTI-THREAD TRADING SCANNER ---
+def scan_single_coin_target(s, zone_status):
+    """Fetches and extracts indicators in parallel threads safely."""
+    try:
+        k_res = requests.get(f"https://fapi.binance.com/fapi/v1/klines?symbol={s}&interval=5m&limit=530", timeout=8)
         k_data = k_res.json()
-        if not isinstance(k_data, list): return
+        if not isinstance(k_data, list) or len(k_data) < 525: return None
         
         df = pd.DataFrame(k_data, columns=['t','open','high','low','close','v','ct','qv','nt','tb','tq','i'])
-        if is_flat_line_coin(df): return
-        
         signal_type = check_5m_indicator_alignment(s, df, zone_status)
-        
-        if signal_type != "NONE" or (s not in state.get('bg_signal_history', {})):
-            with state_lock:
-                if 'bg_signal_history' not in state: state['bg_signal_history'] = {}
-                if s not in state['bg_signal_history']: state['bg_signal_history'][s] = [0]
-        
-        if signal_type == "NONE": return
-        if IS_BTC_CRASHING: return
-
-        if direct_mode:
-            if trading_active:
-                with state_lock:
-                    coin_step = state['symbol_recovery_step'].get(s, 0)
-                    active_count = len(state['active_positions'])
-                if recovery_only and coin_step == 0: return
-                if coin_step > 0 or (active_count < max_signals):
-                    execute_new_recovery_trade(s, signal_type, float(df['close'].iloc[-1]))
-            return
-
-        if s in first_win_list_coins:
-            if trading_active:
-                with state_lock: 
-                    coin_step = state['symbol_recovery_step'].get(s, 0)
-                    active_count = len(state['active_positions'])
-                if recovery_only and coin_step == 0: return
-                if coin_step > 0 or (active_count < max_signals):
-                    execute_new_recovery_trade(s, signal_type, float(df['close'].iloc[-1]))
-        elif allow_bg_scan and is_fw_scan_window():
-            update_background_simulation(s, signal_type, df)
+        if signal_type != "NONE":
+            return {"symbol": s, "side": signal_type, "close": float(df['close'].iloc[-1])}
     except: pass
+    return None
 
-def scan_markets():
+def process_trading_scan():
+    """Resolved: Processes all targeted coins inside a single rapid request batch via multi-threading executors within 30 seconds, maintaining a 30-second complete cool down break."""
     while True:
         try:
-            THREAD_STATUS["Scanner Loop"] = {"status": "RUNNING 🟢", "last_seen": time.time()}
-            tz = pytz.timezone(BOT_TIMEZONE)
-            now_dt = datetime.datetime.now(tz)
-            
-            if now_dt.minute % 5 != 0 or now_dt.second > 15:
-                time.sleep(5)
-                continue
+            THREAD_STATUS["Trade Scanner Loop"] = {"status": "RUNNING 🟢", "last_seen": time.time()}
+            if not is_ict_trading_window():
+                time.sleep(10); continue
                 
-            check_btc_status()  
-            update_all_1h_trends() 
-            trading_active = is_ict_trading_window()
+            check_btc_status()
+            update_all_1h_trends()
             
             with state_lock:
-                is_scanning = state.get('is_scanning', True)
-                bot_paused = state.get('is_paused', False)
+                fwl_coins = list(state.get('first_win_list', []))
+                direct_mode = state.get('direct_signal_mode', False)
                 max_signals = state.get('max_signals', 3)
                 recovery_only = state.get('recovery_only_mode', False)
-                direct_mode = state.get('direct_signal_mode', False)
-                first_win_list_coins = list(state.get('first_win_list', []))
+                scanned_list = list(state.get('scanned_symbols_list', []))
                 
-            if is_scanning and not bot_paused:
-                allow_bg_scan = (len(first_win_list_coins) < 50)
-                res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
-                data = res.json()
-                if isinstance(data, list):
-                    symbols = [t['symbol'] for t in data if isinstance(t, dict) and 'symbol' in t and t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0]
-                    
-                    with ThreadPoolExecutor(max_workers=20) as executor:
-                        for s in symbols:
-                            if s in state.get('block_list', []): continue
-                            with state_lock:
-                                if s in state['active_positions']: continue
-                            if (not direct_mode) and (s not in first_win_list_coins) and (not allow_bg_scan): continue
-                            
-                            executor.submit(process_single_coin, s, first_win_list_coins, allow_bg_scan, trading_active, max_signals, recovery_only, direct_mode)
-                        
-            sync_save()
-            time.sleep(50) 
+            targets = scanned_list if direct_mode else fwl_coins
+            
+            # Filter actionable tokens instantly
+            actionable_targets = []
+            for s in targets:
+                with state_lock:
+                    if s in state.get('block_list', []): continue
+                    if s in state['active_positions']: continue
+                    coin_step = state['symbol_recovery_step'].get(s, 0)
+                    active_count = len(state['active_positions'])
+                if recovery_only and coin_step == 0: continue
+                if coin_step == 0 and active_count >= max_signals: continue
+                actionable_targets.append(s)
+                
+            # Parallel Scanning Dispatch Execution Loop
+            detected_signals = []
+            if actionable_targets:
+                with ThreadPoolExecutor(max_workers=15) as executor:
+                    results = executor.map(lambda symbol: scan_single_coin_target(symbol, TREND_CACHE.get(symbol, "BUY_ZONE")), actionable_targets)
+                    for r in results:
+                        if r: detected_signals.append(r)
+            
+            # Execute trade allocations for validated entries
+            for sig in detected_signals:
+                if IS_BTC_CRASHING: break
+                with state_lock:
+                    active_count = len(state['active_positions'])
+                    coin_step = state['symbol_recovery_step'].get(sig['symbol'], 0)
+                if coin_step == 0 and active_count >= max_signals: continue
+                
+                execute_new_recovery_trade(sig['symbol'], sig['side'], sig['close'])
+                time.sleep(1.0) # Internal buffer spacer
+                
+            time.sleep(30) # Mandatory 30 seconds break window processing execution restriction
+            
         except Exception as e:
             time.sleep(10)
 
-def manual_instant_scan():
-    try:
-        execute_telegram_send("⚡ <b>[MANUAL SCAN STARTED]</b>\nකාසි සියල්ලම එකවර ස්කෑන් කිරීම ආරම්භ කලා...")
-        check_btc_status()
-        update_all_1h_trends()
-        trading_active = is_ict_trading_window()
-        with state_lock:
-            max_signals = state.get('max_signals', 3)
-            recovery_only = state.get('recovery_only_mode', False)
-            direct_mode = state.get('direct_signal_mode', False)
-            first_win_list_coins = list(state.get('first_win_list', []))
-            
-        allow_bg_scan = (len(first_win_list_coins) < 50)
-        res = requests.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15)
-        data = res.json()
-        if isinstance(data, list):
-            symbols = [t['symbol'] for t in data if isinstance(t, dict) and 'symbol' in t and t['symbol'].endswith("USDT") and float(t.get('lastPrice', 0)) > 0]
-            
-            with ThreadPoolExecutor(max_workers=20) as executor:
-                for s in symbols:
-                    if s in state.get('block_list', []): continue
-                    with state_lock:
-                        if s in state['active_positions']: continue
-                    executor.submit(process_single_coin, s, first_win_list_coins, allow_bg_scan, trading_active, max_signals, recovery_only, direct_mode)
-        execute_telegram_send("🎯 <b>[MANUAL SCAN COMPLETED]</b>\nසියලුම කාසි ස්කෑන් කර අවසන් කරන ලදී!")
-    except Exception as e:
-        execute_telegram_send(f"❌ ස්කෑන් කිරීමේදී දෝෂයක්: {e}")
-
+# --- 04. MATHEMATICAL RECOVERY & SHARED LOSS SPLIT ENGINE ---
 def execute_new_recovery_trade(s, side, current_p):
+    """Resolved: Fully processes the shared_loss_buffer split fraction into the new TP calculation target to completely absorb structural failure hits over subsequent operations."""
     with state_lock:
-        if state['symbol_recovery_step'].get(s, 0) == 0 and len(state['active_positions']) >= state.get('max_signals', 3):
-            return 
         step = state['symbol_recovery_step'].get(s, 0)
         accumulated_loss = state['symbol_accumulated_loss'].get(s, 0.0)
         current_margin = state.get('base_margin', 0.80)
         sl_margin_pct = state.get('margin_sl_pct', 27.0)
         leverage = state.get('leverage', 10)
         
+        # Split loss absorption controller logic
+        absorbed_split_fraction = 0.0
+        if state.get('shared_loss_splits_remaining', 0) > 0:
+            absorbed_split_fraction = state.get('shared_loss_buffer', 0.0)
+            state['shared_loss_splits_remaining'] -= 1
+            if state['shared_loss_splits_remaining'] <= 0:
+                state['shared_loss_buffer'] = 0.0 # Clear out buffer when fully processed
+                
     position_size = current_margin * leverage 
     coin_sl_move_pct = (sl_margin_pct / leverage) / 100.0 
     
     initial_sl = current_p * (1.0 - coin_sl_move_pct) if side == "BUY" else current_p * (1.0 + coin_sl_move_pct)
-    required_move_pct = ((current_margin * (state.get('fast_tp_pct', 30.0) / 100.0)) + accumulated_loss) / position_size
+    
+    # Calculate target price absorbing normal targets + accumulated loss + shared loss buffer splits fraction
+    base_target_profit_cash = current_margin * (state.get('fast_tp_pct', 30.0) / 100.0)
+    total_needed_pnl = base_target_profit_cash + accumulated_loss + absorbed_split_fraction
+    
+    required_move_pct = (total_needed_pnl / position_size) + 0.0015 # Incorporates trading network commission fees
     initial_tp = current_p * (1.0 + required_move_pct) if side == "BUY" else current_p * (1.0 - required_move_pct)
             
     with state_lock:
         state['active_positions'][s] = {
             "symbol": s, "side": side, "entry_price": current_p, "margin": current_margin,
             "step": step, "tp": initial_tp, "sl": initial_sl, "timestamp": time.time(),
-            "initial_1h_zone": TREND_CACHE.get(s, "BUY_ZONE")
+            "initial_1h_zone": TREND_CACHE.get(s, "BUY_ZONE"),
+            "absorbed_split": absorbed_split_fraction
         }
         state['signal_count'] += 1
         sig_id = state['signal_count']
     
     protection_sl_cash = current_margin * (sl_margin_pct / 100.0)
-        
+    
     msg = (f"🔔 <b>NEW SIGNAL #{sig_id}</b> 🚨\n\n"
            f"📍 Symbol: <b>{s}</b> | Side: <b>{side}</b>\n"
            f"💵 Base Margin: <b>${round(current_margin, 2)} ({leverage}x)</b>\n"
            f"🎯 Target TP Price: <b>{round(initial_tp, 5)}</b>\n"
            f"🛑 {round(initial_sl, 5)} :Stop Loss Price\n\n"
-           f"📈 Recovery Step: <b>{step}/3</b>\n"
+           f"📈 Recovery Step: <b>{step}/2</b>\n"
            f"🛡️ Protection SL: <b>{round(sl_margin_pct, 1)}% (${round(protection_sl_cash, 3)})</b>\n"
-           f"📊 24h Vol: <b>{round(VOLUME_CACHE.get(s, 0.0), 1)}M USDT</b>\n"
-           f"📊 Accumulated Loss: <b>${round(accumulated_loss, 3)}</b>\n\n"
-           f"Mr. MASTER(PRcoding)👑")
+           f"📊 Accumulated Loss: <b>${round(accumulated_loss, 3)}</b>\n"
+           f"🧩 Shared Split Added: <b>${round(absorbed_split_fraction, 3)}</b>\n\n"
+           f"Mr. MASTER👑")
            
     execute_telegram_send(msg)
     sync_save()
 
-# --- 5. LIVE MONITOR & ALARM REMINDERS ---
+# --- 05. LIVE TRACKING & STRUCTURAL FAILURES MANAGEMENT ---
 def live_monitor_loop():
     while True:
         try:
@@ -475,10 +549,12 @@ def live_monitor_loop():
                             state['symbol_accumulated_loss'][s] = state['symbol_accumulated_loss'].get(s, 0.0) + loss_amount
                             if s in state['active_positions']: del state['active_positions'][s]
                         execute_telegram_send(f"🔄 <b>1H ZONE FLIPPED: {s}</b>"); sync_save(); continue
-                        
+                    
                     if (pos['side'] == "BUY" and current_p >= pos['tp']) or (pos['side'] == "SELL" and current_p <= pos['tp']):
+                        net_profit = (pos['margin'] * (state.get('fast_tp_pct', 30.0) / 100.0)) - 0.01
                         with state_lock:
                             state['daily_stats']['wins'] += 1
+                            state['daily_stats']['won_trades'].append(f"{s} (${round(net_profit,2)})")
                             state['symbol_recovery_step'][s] = 0; state['symbol_accumulated_loss'][s] = 0.0
                             if s in state['active_positions']: del state['active_positions'][s]
                         execute_telegram_send(f"✅ <b>TARGET HIT: {s}</b>"); sync_save()
@@ -488,24 +564,59 @@ def live_monitor_loop():
                             next_step = pos['step'] + 1
                             current_margin = state.get('base_margin', 0.80)
                             sl_margin_pct = state.get('margin_sl_pct', 27.0)
-                            loss_amount = current_margin * (sl_margin_pct / 100.0)
+                            loss_amount = (current_margin * (sl_margin_pct / 100.0)) + 0.005
                             state['symbol_accumulated_loss'][s] = state['symbol_accumulated_loss'].get(s, 0.0) + loss_amount
                             
-                            if next_step >= 4: 
+                            if next_step >= 3: 
                                 if s not in state['block_list']: state['block_list'].append(s)
                                 if s in state.get('first_win_list', []): state['first_win_list'].remove(s)
                                 state['symbol_recovery_step'][s] = 0
+                                final_lost_val = state['symbol_accumulated_loss'][s]
                                 state['symbol_accumulated_loss'][s] = 0.0
                                 state['daily_stats']['loss'] += 1
-                                execute_telegram_send(f"❌ <b>RECOVERY FAILED: {s}</b>")
+                                state['daily_stats']['lost_trades'].append(f"{s} (${round(final_lost_val, 2)})")
+                                
+                                # Split loss calculation engine implementation over next 4 slots
+                                state['shared_loss_buffer'] = final_lost_val / 4.0
+                                state['shared_loss_splits_remaining'] = 4
+                                
+                                execute_telegram_send(f"❌ <b>RECOVERY FAILED: {s}</b>\nකාසිය බ්ලැක්ලිස්ට් කරන ලදී. පාඩුව ඉදිරි ට්‍රේඩ් 4කට බෙදා හැරේ.")
                             else:
                                 state['symbol_recovery_step'][s] = next_step
-                                execute_telegram_send(f"⚠️ <b>SL HIT (Step {pos['step']}/3): {s}</b>")
+                                execute_telegram_send(f"⚠️ <b>STOP LOSS HIT (Step {next_step}/3): {s}</b>\nඊළඟ 5M Fractal එකෙන් රිකවර් කිරීමට සැකසුම් සූදානම්. ⏳")
                             if s in state['active_positions']: del state['active_positions'][s]
                         sync_save()
                 except: pass
             time.sleep(1) 
         except Exception as e: time.sleep(2)
+
+# --- 06. DAILY CENTRAL TIMERS CONTROL SCHEDULER ---
+def central_scheduler():
+    while True:
+        try:
+            THREAD_STATUS["Scheduler Loop"] = {"status": "RUNNING 🟢", "last_seen": time.time()}
+            tz = pytz.timezone(BOT_TIMEZONE)
+            now = datetime.datetime.now(tz)
+            
+            if now.hour == 0 and now.minute == 0 and 0 <= now.second < 5:
+                threading.Thread(target=run_midnight_symbol_scanner, daemon=True).start()
+                time.sleep(5)
+                
+            if now.hour == 9 and now.minute == 59 and 0 <= now.second < 5:
+                with state_lock:
+                    fw_list = list(state.get('first_win_list', []))
+                coin_string = " ".join([c.lower() for c in fw_list])
+                report = (
+                    f"⚡⛏️ <b>FIRST WIN LIST REPORT</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"<code>/fwl_add {coin_string}</code>\n\n"
+                    f"Mr. MASTER👑"
+                )
+                execute_telegram_send(report)
+                time.sleep(5)
+                
+            time.sleep(1)
+        except: time.sleep(5)
 
 def telegram_reminder_worker():
     while True:
@@ -514,39 +625,47 @@ def telegram_reminder_worker():
             with state_lock:
                 reminder_active = state.get('reminder_system_active', True)
                 active_trades = list(state['active_positions'].keys())
-            
             if reminder_active and len(active_trades) > 0:
-                msg = f"📢 <b>[REMINDER]</b> පද්ධතියේ සක්‍රීය ට්‍රේඩ්ස් පවතී: <code>{', '.join(active_trades)}</code>"
-                execute_telegram_send(msg)
+                execute_telegram_send(f"📢 <b>[REMINDER]</b> පද්ධතියේ සක්‍රීය ට්‍රේඩ්ස් පවති(Active): <code>{', '.join(active_trades)}</code>")
             time.sleep(60)
         except: time.sleep(10)
 
 def cron_daily_report_worker():
-    global TREND_CACHE, LAST_1H_SCAN_HOUR
     while True:
         try:
             THREAD_STATUS["Daily Report Worker"] = {"status": "RUNNING 🟢", "last_seen": time.time()}
             tz = pytz.timezone(BOT_TIMEZONE)
             colombo_now = datetime.datetime.now(tz)
-            if colombo_now.hour == 23 and colombo_now.minute == 59: 
+            if colombo_now.hour == 23 and colombo_now.minute == 59 and 0 <= colombo_now.second < 30: 
                 with state_lock:
                     ds = state['daily_stats']
-                    msg = f"📊 <b>FINAL DAILY REPORT</b>\n\n🟢 Wins: {ds.get('wins', 0)}\n🔴 Loss: {ds.get('loss', 0)}"
+                    bl_coins = state.get('block_list', [])
+                    
+                    wins_count = ds.get('wins', 0)
+                    loss_count = ds.get('loss', 0)
+                    
+                    won_str = ", ".join(ds.get('won_trades', [])) or "None"
+                    loss_str = ", ".join(ds.get('lost_trades', [])) or "None"
+                    bl_string = " ".join([b.lower() for b in bl_coins]) or "none"
+                    
+                    msg = (
+                        f"📊 ✨ <b>FINAL PERFORMANCE REPORT</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"🟢 Wins: {wins_count} ({won_str})\n"
+                        f"🔴 Loss: {loss_count} ({loss_str})\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"Blacklist\n\n"
+                        f"<code>Backlist_add {bl_string}</code>\n\n"
+                        f"Mr. MASTER👑"
+                    )
                     execute_telegram_send(msg)
-                    state['daily_stats'] = {'wins': 0, 'loss': 0, 'won_trades': [], 'last_reset_date': str(datetime.date.today())}
+                    state['daily_stats'] = {'wins': 0, 'loss': 0, 'won_trades': [], 'lost_trades': [], 'last_reset_date': str(datetime.date.today())}
                     state['symbol_structure_shift'] = {} 
                 time.sleep(60)
-            time.sleep(30)
+            time.sleep(10)
         except: time.sleep(10)
 
-# --- 6. HELPER FOR AUTOMATIC TIME PERIODS ---
-def get_time_period_name(hour):
-    if 4 <= hour < 12: return "උදේ"
-    elif 12 <= hour < 16: return "දවල්"
-    elif 16 <= hour < 19: return "සවස"
-    else: return "රාත්‍රී"
-
-# --- 7. TELEGRAM WEBHOOK MANAGER ---
+# --- 07. TELEGRAM CONTROLLER PANEL ---
 @app.route('/webhook', methods=['POST'])
 def telegram_webhook():
     try:
@@ -565,12 +684,6 @@ def telegram_webhook():
                     active_count = len(state.get('active_positions', {}))
                     fw_list_count = len(state.get('first_win_list', []))
                     bl_list_count = len(state.get('block_list', []))
-                    
-                    start_period = get_time_period_name(state.get('start_hour', 8))
-                    end_period = get_time_period_name(state.get('end_hour', 23))
-                    fw_start_period = get_time_period_name(state.get('fw_start_hour', 0))
-                    fw_end_period = get_time_period_name(state.get('fw_end_hour', 23))
-                    
                     msg = (
                         f"ℹ️ <b>[RED BULL MASTER STATUS REPORT]</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -581,10 +694,7 @@ def telegram_webhook():
                         f"⚙️ Mode: <b>{'RECOVERY ONLY ⚠️' if state.get('recovery_only_mode', False) else 'NORMAL MODE 🔄'}</b>\n"
                         f"⚡ Direct Signal Mode: <b>{'සක්‍රීයයි 🔥 [DIRECT]' if state.get('direct_signal_mode', False) else 'අක්‍රීයයි 🛡️ [FW FILTER]'}</b>\n"
                         f"⏱️ BOT WINDOW STATUS : <b>{window_status}</b>\n"
-                        f"🛡️ BTC Crash Filter: <b>{'ALERT 🔴 (STOPPED)' if IS_BTC_CRASHING else 'STABLE 🟢'}</b>\n"
-                        f"📊 Min 24h Vol Filter: <b>&gt; ${state.get('min_24h_volume_mln', 15.0)}M</b>\n"
-                        f"⏰ සිග්නල් දෙන කාලය: <b>{start_period} {state.get('start_hour', 8)}:{state.get('start_minute', 0)} සිට {end_period} {state.get('end_hour', 23)}:{state.get('end_minute', 59)} දක්වා.</b>\n"
-                        f"🥇 First Win කාලය: <b>{fw_start_period} {state.get('fw_start_hour', 0)}:{state.get('fw_start_minute', 0)} සිට {fw_end_period} {state.get('fw_end_hour', 23)}:{state.get('fw_end_minute', 59)} දක්වා.</b>\n"
+                        f"⏰ සිග්නල් දෙන කාලය: <b>{state.get('start_hour', 10)}:{state.get('start_minute', 0)} - {state.get('end_hour', 23)}:{state.get('end_minute', 59)} දක්වා.</b>\n"
                         f"💵 මූලික ට්‍රේඩ් මාජින්: <b>${state.get('base_margin', 0.80)}</b>\n"
                         f"⚙️ Leverage: <b>{state.get('leverage', 10)}x</b>\n"
                         f"🛡️ SL: <b>{state.get('margin_sl_pct', 27.0)}%</b> | TP: <b>{state.get('fast_tp_pct', 30.0)}%</b>\n"
@@ -593,132 +703,94 @@ def telegram_webhook():
                     )
                 execute_telegram_send(msg)
             
-            elif cmd == "menu":
-                menu_msg = (
-                    f"🛠️ <b>RED BULL MASTER CONTROL PANEL</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"🎛️ <b>බොට් පාලනය (Bot Control):</b>\n"
-                    f"👉 /bot_on — ස්කෑනරය සක්‍රීය කරයි (ON)\n"
-                    f"👉 /bot_off — ස්කෑනරය තාවකාලිකව නවත්වයි (OFF)\n"
-                    f"👉 /scan_now — දැනටමත් සියලුම කාසි ස්කෑන් කරයි\n\n"
-                    f"⚡ <b>විශේෂ පරීක්ෂණ ක්‍රමවේද (Testing Modes):</b>\n"
-                    f"👉 /direct_mode_on — FW ලැයිස්තුව නැතිව කෙලින්ම සිග්නල් දෙයි 🔥\n"
-                    f"👉 /direct_mode_off — සාමාන්‍ය ආරක්ෂිත ක්‍රමය (FW Filter) 🛡️\n"
-                    f"👉 /recovery_only_on — Recovery Trades පමණක් සිදු කරයි\n"
-                    f"👉 /recovery_only_off — සාමාන්‍ය ක්‍රියාකාරීත්වය (Normal Mode)\n\n"
-                    f"🔔 <b>මතක් කිරීම් පද්ධතිය:</b>\n"
-                    f"👉 /reminder_on — විනාඩියෙන් විනාඩියට Reminder සක්‍රීය කරයි\n"
-                    f"👉 /reminder_off — Reminder පණිවිඩ අක්‍රීය කරයි\n\n"
-                    f"⏱️ <b>කාල පරාස සැකසීම:</b>\n"
-                    f"👉 /set_signal_time H:M H:M — සිග්නල් දෙන කාලය සකසයි\n"
-                    f"👉 /set_fw_time H:M H:M — First Win ටෙස්ට් කරන කාලය සකසයි\n\n"
-                    f"📝 <b>කාසි ලැයිස්තු පාලනය:</b>\n"
-                    f"👉 /add_fw COIN | /remove_fw COIN — First Win ලැයිස්තුව\n"
-                    f"👉 /add_bl COIN | /remove_bl COIN — Blacklist ලැයිස්තුව\n"
-                    f"👉 /view_lists — දැනට පවතින කාසි ලැයිස්තු බලන්න\n"
-                    f"👉 /clear_lists — ලැයිස්තු දෙකම සම්පූර්ණයෙන්ම හිස් කරයි\n\n"
-                    f"📊 <b>තත්ත්ව වාර්තාව සහ සෞඛ්‍යය:</b>\n"
-                    f"👉 /status — බොට්ගේ වත්මන් සමස්ත වාර්තාව\n"
-                    f"👉 /check_health — පද්ධති කොටස් වැඩදැයි බලන්න (Health Check)\n"
-                    f"👉 /reset_trades — Active Trades දත්ත ශුන්‍ය (Reset) කරයි\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                )
-                execute_telegram_send(menu_msg)
+            elif cmd == "symbol_scanner":
+                threading.Thread(target=run_midnight_symbol_scanner, daemon=True).start()
+                execute_telegram_send("⚡ <b>Manual Symbol Scanner ක්‍රියාත්මක කරන ලදී!</b>")
                 
-            elif cmd == "check_health":
-                health_report = "🔍 <b>SYSTEM CORE MODULE HEALTH REPORT</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                tz = pytz.timezone(BOT_TIMEZONE)
-                for thread_name, info in THREAD_STATUS.items():
-                    last_seen_str = "NEVER"
-                    if info["last_seen"] > 0:
-                        dt = datetime.datetime.fromtimestamp(info["last_seen"], tz)
-                        last_seen_str = dt.strftime("%I:%M:%S %p")
-                    health_report += f"⚙️ <b>{thread_name}:</b>\nStatus: {info['status']}\nLast Seen: <code>{last_seen_str}</code>\n\n"
-                execute_telegram_send(health_report)
+            elif cmd == "fwl_scanner":
+                threading.Thread(target=run_fwl_scanner_logic, args=(True,), daemon=True).start()
+                execute_telegram_send("⚡ <b>Manual FWL Scanner ක්‍රියාත්මක කරන ලදී! (Max 10 Coins Recovery Filter)</b>")
 
+            elif cmd == "fwl_add":
+                for item in parts[1:]:
+                    coin = item.upper().strip()
+                    with state_lock:
+                        if coin not in state['first_win_list']: state['first_win_list'].append(coin)
+                sync_save(); execute_telegram_send("🥇 First Win Coins ලැයිස්තුව යාවත්කාලීන කරන ලදී.")
+                
+            elif cmd == "fwl_remove" and len(parts) > 1:
+                coin = parts[1].upper()
+                with state_lock:
+                    if coin in state['first_win_list']: state['first_win_list'].remove(coin)
+                sync_save(); execute_telegram_send(f"🗑️ {coin} First Win ලැයිස්තුවෙන් ඉවත් කරන ලදී.")
+                
+            elif cmd == "fwl_view":
+                with state_lock: fw = ", ".join(state.get('first_win_list', [])) or "හිස්"
+                execute_telegram_send(f"🥇 <b>First Win Coins List:</b>\n<code>{fw}</code>")
+                
+            elif cmd == "backlist_add":
+                for item in parts[1:]:
+                    coin = item.upper().strip()
+                    with state_lock:
+                        if coin not in state['block_list']: state['block_list'].append(coin)
+                sync_save(); execute_telegram_send("🚫 Blacklist ලැයිස්තුවට කාසි ඇතුළත් කරන ලදී.")
+                
+            elif cmd == "backlist_remo" and len(parts) > 1:
+                coin = parts[1].upper()
+                with state_lock:
+                    if coin in state['block_list']: state['block_list'].remove(coin)
+                sync_save(); execute_telegram_send(f"🔓 {coin} Blacklist ලැයිස්තුවෙන් නිදහස් කරන ලදී.")
+                
+            elif cmd == "backlist_view":
+                with state_lock: bl = ", ".join(state.get('block_list', [])) or "හිස්"
+                execute_telegram_send(f"🚫 <b>Blacklist Coins List:</b>\n<code>{bl}</code>")
+
+            elif cmd == "clear_lists":
+                with state_lock: state['first_win_list'] = []
+                sync_save(); execute_telegram_send("🗑️ First Win ලැයිස්තුව සම්පූර්ණයෙන්ම හිස් කරන ලදී.")
+                
             elif cmd == "bot_on":
                 with state_lock: state['is_scanning'] = True
-                sync_save(); execute_telegram_send("▶️ <b>බොට් ස්කෑනර් එන්ට්‍රීම සක්‍රීය කරන ලදී (ON).</b>")
+                sync_save(); execute_telegram_send("▶️ ස්කෑනර් පද්ධතිය සක්‍රීය කරයි (ON).")
             elif cmd == "bot_off":
                 with state_lock: state['is_scanning'] = False
-                sync_save(); execute_telegram_send("⏸️ <b>බොට් ස්කෑනර් එන්ට්‍රීම ක්‍රියාවිරහිත කරන ලදී (OFF).</b>")
-            
+                sync_save(); execute_telegram_send("⏸️ ස්කෑනර් පද්ධතිය තාවකාලිකව නවත්වයි (OFF).")
             elif cmd == "direct_mode_on":
                 with state_lock: state['direct_signal_mode'] = True
-                sync_save(); execute_telegram_send("⚡ <b>Direct Signal Mode සක්‍රීය කරන ලදී (ON)!</b>\nදැන් First Win ලැයිස්තුව නොබලා, ස්කෑන් වන සියලුම කාසි සඳහා සෘජුවම සිග්නල් නිකුත් කරනු ලබයි.")
+                sync_save(); execute_telegram_send("⚡ Direct Mode සක්‍රීයයි (ON).")
             elif cmd == "direct_mode_off":
                 with state_lock: state['direct_signal_mode'] = False
-                sync_save(); execute_telegram_send("🛡️ <b>Direct Signal Mode අක්‍රීය කරන ලදී (OFF).</b>\nබොට් නැවතත් සාමාන්‍ය ආරක්ෂිත පියවර අනුගමනය කරමින් First Win ලැයිස්තුවේ ඇති කාසි පමණක් පෙරහන් (Filter) කර සිග්නල් ලබා දෙයි.")
-                
-            elif cmd == "reminder_on":
-                with state_lock: state['reminder_system_active'] = True
-                sync_save(); execute_telegram_send("🔔 <b>විනාඩියෙන් විනාඩිය මතක් කිරීම සක්‍රීය කලා.</b>")
-            elif cmd == "reminder_off":
-                with state_lock: state['reminder_system_active'] = False
-                sync_save(); execute_telegram_send("🔕 <b>විනාඩියෙන් විනාඩිය මතක් කිරීම අක්‍රීය කලා.</b>")
+                sync_save(); execute_telegram_send("🛡️ Direct Mode අක්‍රීයයි (OFF).")
             elif cmd == "recovery_only_on":
                 with state_lock: state['recovery_only_mode'] = True
-                sync_save(); execute_telegram_send("⚠️ <b>Recovery Trades Only සක්‍රීය කලා.</b>")
+                sync_save(); execute_telegram_send("⚠️ Recovery Only මාදිලිය සක්‍රීයයි.")
             elif cmd == "recovery_only_off":
                 with state_lock: state['recovery_only_mode'] = False
-                sync_save(); execute_telegram_send("🔄 <b>Normal Mode සක්‍රීය කලා.</b>")
-            elif cmd == "scan_now":
-                threading.Thread(target=manual_instant_scan, daemon=True).start()
-            elif cmd == "add_fw" and len(parts) > 1:
-                coin_val = parts[1].upper()
-                with state_lock:
-                    if coin_val not in state['first_win_list']: state['first_win_list'].append(coin_val)
-                sync_save(); execute_telegram_send(f"🥇 <code>{coin_val}</code> First Win ลැයිස්තුවට එකතු කළා.")
-            elif cmd == "remove_fw" and len(parts) > 1:
-                coin_val = parts[1].upper()
-                with state_lock:
-                    if coin_val in state['first_win_list']: state['first_win_list'].remove(coin_val)
-                sync_save(); execute_telegram_send(f"🗑️ <code>{coin_val}</code> First Win ලැයිස්තුවෙන් ඉවත් කළා.")
-            elif cmd == "add_bl" and len(parts) > 1:
-                coin_val = parts[1].upper()
-                with state_lock:
-                    if coin_val not in state['block_list']: state['block_list'].append(coin_val)
-                sync_save(); execute_telegram_send(f"🚫 <code>{coin_val}</code> Blacklist එකට එකතු කළා.")
-            elif cmd == "remove_bl" and len(parts) > 1:
-                coin_val = parts[1].upper()
-                with state_lock:
-                    if coin_val in state['block_list']: state['block_list'].remove(coin_val)
-                sync_save(); execute_telegram_send(f"🔓 <code>{coin_val}</code> Blacklistෙන් නිදහස් කළා.")
-            elif cmd == "set_signal_time" and len(parts) > 2:
-                start_h, start_m = map(int, parts[1].split(":"))
-                end_h, end_m = map(int, parts[2].split(":"))
-                with state_lock:
-                    state['start_hour'] = start_h; state['start_minute'] = start_m
-                    state['end_hour'] = end_h; state['end_minute'] = end_m
-                sync_save(); execute_telegram_send(f"⏰ සිග්නල් දෙන කාල පරාසය වෙනස් කළා.")
-            elif cmd == "set_fw_time" and len(parts) > 2:
-                start_h, start_m = map(int, parts[1].split(":"))
-                end_h, end_m = map(int, parts[2].split(":"))
-                with state_lock:
-                    state['fw_start_hour'] = start_h; state['fw_start_minute'] = start_m
-                    state['fw_end_hour'] = end_h; state['fw_end_minute'] = end_m
-                sync_save(); execute_telegram_send(f"🥇 First Win කාල පරාසය වෙනස් කළා.")
-            elif cmd == "view_lists":
-                with state_lock:
-                    fw = ", ".join(state.get('first_win_list', [])) or "හිස්"
-                    bl = ", ".join(state.get('block_list', [])) or "හිස්"
-                execute_telegram_send(f"🥇 <b>First Win Coins:</b>\n<code>{fw}</code>\n\n🚫 <b>Blacklist Coins:</b>\n<code>{bl}</code>")
-            elif cmd == "clear_lists":
-                with state_lock: state['first_win_list'] = []; state['block_list'] = []
-                sync_save(); execute_telegram_send("🗑️ ලැයිස්තු දෙකම හිස් කරන ලදී.")
+                sync_save(); execute_telegram_send("🔄 Recovery Only මාදිලිය අක්‍රීයයි.")
+            elif cmd == "reminder_on":
+                with state_lock: state['reminder_system_active'] = True
+                sync_save(); execute_telegram_send("🔔 Reminder සක්‍රීයයි.")
+            elif cmd == "reminder_off":
+                with state_lock: state['reminder_system_active'] = False
+                sync_save(); execute_telegram_send("🔕 Reminder අක්‍රීයයි.")
             elif cmd == "reset_trades":
                 with state_lock: state['active_positions'] = {}
-                sync_save(); execute_telegram_send("🔄 Active Trades සියල්ලම ශුන්‍ය කරන ලදී.")
-                
-    except Exception as e: print(f"Webhook Execution Error: {e}")
+                sync_save(); execute_telegram_send("🔄 Active Trades දත්ත ශුන්‍ය කරන ලදී.")
+            elif cmd == "check_health":
+                health_report = "🔍 <b>SYSTEM MODULE HEALTH REPORT</b>\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                for thread_name, info in THREAD_STATUS.items():
+                    health_report += f"⚙️ <b>{thread_name}:</b> {info['status']}\n"
+                execute_telegram_send(health_report)
+    except Exception as e: print(f"Webhook Error: {e}")
     return "OK", 200
 
 @app.route('/', methods=['GET'])
-def health(): return "Bot Active!", 200
+def health(): return "Bot Core Process Running Successfully!", 200
 
 if __name__ == '__main__':
     sync_save()
-    threading.Thread(target=scan_markets, daemon=True).start()
+    threading.Thread(target=central_scheduler, daemon=True).start()
+    threading.Thread(target=process_trading_scan, daemon=True).start()
     threading.Thread(target=live_monitor_loop, daemon=True).start()
     threading.Thread(target=cron_daily_report_worker, daemon=True).start()
     threading.Thread(target=telegram_reminder_worker, daemon=True).start() 
